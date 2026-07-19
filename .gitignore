@@ -1,0 +1,12 @@
+# 가상환경·캐시
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 처리 산출물 — 실제 문서·개인정보 포함 가능, 절대 커밋 금지
+out/
+out_a/
+*_masked.pdf
+*_aliased.pdf
+pseudonym_ledger.json
