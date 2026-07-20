@@ -394,6 +394,7 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     doc = fitz.open(in_path)
     full_text = "".join(page.get_text() for page in doc)
     ocr_applied = False
+    ocr_tmp = None   # OCR 경유 시 임시 PDF 경로 — 종료 시 삭제(비실명화 전 원문 포함)
     if not full_text.strip():
         # 텍스트 레이어 없는 순수 스캔 → ocrmypdf로 레이어를 입힌 뒤 진행
         import shutil
@@ -515,8 +516,14 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
             # 기준선 방식 insert_text로 무조건 그린다
             baseline = fitz.Point(rect.x0 + 1, rect.y1 - rect.height * 0.28)
             page.insert_text(baseline, repl, fontname="krmask", fontsize=fontsize)
+    # 메타데이터·XMP 소거 — 본문을 다 지워도 Author/Creator(워드 계정명·소속)가
+    # 문서 정보와 XMP에 그대로 남으면 그게 유출 채널이다
+    doc.set_metadata({})
+    doc.del_xml_metadata()
     doc.save(out_path, garbage=4, deflate=True)
     doc.close()
+    if ocr_tmp and os.path.exists(ocr_tmp):
+        os.unlink(ocr_tmp)
     if mode == "pseudo" and ledger_path:
         with open(ledger_path, "w", encoding="utf-8") as f:
             json.dump(ledger, f, ensure_ascii=False, indent=2)
@@ -524,6 +531,9 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     # ── 사후검증: 저장본 재오픈 → 조각 재검색 ──
     saved = fitz.open(out_path)
     saved_text = "".join(page.get_text() for page in saved)
+    # 메타데이터도 검증 대상 — 값이 하나라도 남아 있으면 잔존으로 취급
+    leftover_meta = {k: v for k, v in (saved.metadata or {}).items()
+                     if v and k not in ("format", "encryption")}
     saved.close()
     compact_saved = re.sub(r"\s+", "", saved_text)
     residual = []
@@ -539,6 +549,8 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
                   compact_value in compact_saved
         if hit:
             residual.append(f"{label}:{value}")
+    for k, v in leftover_meta.items():
+        residual.append(f"META:{k}={v}")
 
     return {
         "mode": mode,

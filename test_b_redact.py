@@ -71,6 +71,8 @@ def make_pdf(lines: list[str], path: str) -> None:
             tw.append((60, y), line, font=font, fontsize=11)
         y += 22
     tw.write_text(page)
+    # 실무 PDF처럼 작성자 메타데이터를 심어 둔다 — 스크럽이 실제로 도는지 검증용
+    doc.set_metadata({"author": "홍길동", "title": "내부 검토용", "creator": "HWP 2022"})
     doc.save(path)
     doc.close()
 
@@ -84,7 +86,11 @@ def run_case(name: str, lines: list[str], must_gone: list[str], must_keep: list[
         report = redact(src, dst, mode=mode, ledger_path=ledger_path)
         assert not report["unmapped"], f"{name}: 매핑 실패 {report['unmapped']}"
         assert not report["residual"], f"{name}: 자체검증 잔존 {report['residual']}"
-        text = "".join(p.get_text() for p in fitz.open(dst))
+        out = fitz.open(dst)
+        leftover = {k: v for k, v in out.metadata.items()
+                    if v and k not in ("format", "encryption")}
+        assert not leftover, f"{name}: 메타데이터 잔존 → {leftover}"
+        text = "".join(p.get_text() for p in out)
         for v in must_gone:
             assert v not in text, f"{name}: PII 잔존 → {v}"
         for v in must_keep:
