@@ -4,9 +4,9 @@
   1. 탐지 단위 — 규칙마다 '잡아야 할 것'과 '잡으면 안 될 것'을 쌍으로 둔다.
      미탐은 유출이고 오탐은 본문 훼손이라, 한쪽만 재면 다른 쪽이 조용히 무너진다.
   2. 경계조건 — 빈 문서·긴 숫자열·제어문자에서 멈추거나 폭주하지 않는가.
-  3. 종단(반출판) — PDF를 실제로 비실명화해 잔존·과잉제거·메타데이터를 검사.
+  3. 종단(외부용) — PDF를 실제로 비실명화해 잔존·과잉제거·메타데이터를 검사.
   4. 가명 대장 — 유형별 가명 꼴과 문서 간 일관성.
-  5. 종단(질의판) — 마스킹 → 복원 왕복이 값을 뒤바꾸지 않는가.
+  5. 종단(내부용) — 마스킹 → 복원 왕복이 값을 뒤바꾸지 않는가.
 
 실행: ~/.venvs/denamer/bin/python test_denamer.py
 """
@@ -19,7 +19,7 @@ from pathlib import Path
 import fitz
 
 sys.path.insert(0, str(Path(__file__).parent))
-import denamer_ask
+import denamer_in
 from denamer_out import redact
 from detect import detect
 from ledger import Ledger
@@ -155,7 +155,7 @@ def test_boundaries() -> None:
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. 종단 (반출판)
+# 4. 종단 (외부용)
 # ══════════════════════════════════════════════════════════════
 FIX_OFFICIAL = (
     [
@@ -261,7 +261,7 @@ def run_pdf_case(name, lines, must_gone, must_keep, mode="anon",
 
 
 def test_end_to_end_out() -> None:
-    print("4. 종단 — 반출판 PDF")
+    print("4. 종단 — 외부용 PDF")
     run_pdf_case("공문서·익명화", *FIX_OFFICIAL, must_have=["홍OO", "김OO", "경기도"])
     run_pdf_case("적대적 변형·익명화", *FIX_ADVERSARIAL, must_have=["박OO", "경상북도"])
     # 법률문서: 익명화 모드에서도 법인명·사건번호는 가명으로 치환한다
@@ -308,10 +308,10 @@ def test_pseudo_and_ledger() -> None:
 
 
 def test_ask_roundtrip() -> None:
-    print("6. 종단 — 질의판 왕복")
+    print("6. 종단 — 내부용 왕복")
     text = ("피고 김철수(880101-1234567)는 원고 이영희에게 010-1234-5678로 연락하였다.\n"
             "이영희의 주민등록번호는 900202-2345678이다.")
-    result = denamer_ask.mask(text)
+    result = denamer_in.mask(text)
     masked, tmap = result["masked"], result["token_map"]
 
     check(not result["collisions"], "토큰 충돌 없음", str(result["collisions"]))
@@ -324,14 +324,111 @@ def test_ask_roundtrip() -> None:
     rrn_tokens = {t for t, e in tmap.items() if e["original"].startswith(("880101", "900202"))}
     check(len(rrn_tokens) == 2, "같은 유형 값 둘이 서로 다른 토큰", str(rrn_tokens))
 
-    restored = denamer_ask.restore(masked, tmap)
+    restored = denamer_in.restore(masked, tmap)
     check(restored["restored"] == text, "왕복 복원이 원문과 완전 일치")
     check(not restored["unresolved"], "미해결 토큰 없음", str(restored["unresolved"]))
 
     # LLM 답변처럼 일부 토큰만 등장하는 경우도 정확히 복원된다
     answer = "[[PERSON_01]]님의 연락처는 [[PHONE_01]]입니다."
-    r2 = denamer_ask.restore(answer, tmap)
+    r2 = denamer_in.restore(answer, tmap)
     check("[[" not in r2["restored"], "부분 답변 복원", r2["restored"])
+
+
+def test_in_alias_style() -> None:
+    print("7. 내부용 — 가명(alias) 표기")
+    text = ("피고 김철수(880101-1234567)는 원고 이영희에게 010-1234-5678로 연락하였다.\n"
+            "주식회사 동방화학은 2020가합12345 사건의 당사자이다. A안과 B안을 검토하였다.")
+    r = denamer_in.mask(text, style="alias")
+    masked, tmap = r["masked"], r["token_map"]
+    check(not r["collisions"], "표기 충돌 없음", str(r["collisions"]))
+    for value in ("김철수", "이영희", "880101-1234567", "010-1234-5678", "동방화학"):
+        check(value not in masked, "가명 표기 후 원문 잔존", repr(value))
+    # 유형이 다르면 가명 꼴도 달라야 한다. 알파벳 풀을 돌려 쓰면 사람과 주민번호가
+    # 모두 'A'가 되어 복원이 뒤섞인다(실측 결함).
+    marks = list(tmap)
+    check(len(marks) == len(set(marks)), "표기 중복 없음", str(marks))
+    check(any(m.startswith("주민번호") for m in marks), "주민번호는 별도 가명 꼴", str(marks))
+    check(any(m.startswith("전화") for m in marks), "전화는 별도 가명 꼴", str(marks))
+    check(any(m.endswith("사") for m in marks), "법인은 A사 꼴", str(marks))
+    # 원문에 이미 'A'가 쓰였으므로(A안) 사람 가명은 A를 비켜 가야 한다
+    check("A" not in marks, "원문과 겹치는 표기는 피한다", str(marks))
+
+    back = denamer_in.restore(masked, tmap)
+    check(back["restored"] == text, "가명 표기 왕복 복원이 원문과 일치")
+    check(not back["unresolved"], "미해결 표기 없음", str(back["unresolved"]))
+
+    # 조사가 바로 붙는 형태에서도 복원돼야 한다 — 경계 규칙이 한글을 막으면 전부 실패한다
+    check("A사은" in masked or "사" in masked, "법인 가명이 조사와 붙어 나온다")
+
+
+def make_scan_pdf(path: str, stamp: str = "법무법인 가나 (인)") -> None:
+    """스캔본 흉내: 쪽을 덮는 이미지 + 도장처럼 짧은 텍스트만.
+
+    실제 사건 문서에서 가장 위험한 형태다 — 레이어가 '있으니' OCR을 건너뛰고,
+    본문은 이미지라 아무것도 탐지되지 않는데 리포트는 OK가 나온다.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 600, 850), False)
+    pix.clear_with(235)
+    page.insert_image(page.rect, pixmap=pix)
+    tw = fitz.TextWriter(page.rect)
+    tw.append((60, 60), stamp, font=fitz.Font("korea"), fontsize=11)
+    tw.write_text(page)
+    doc.save(path)
+    doc.close()
+
+
+def test_thin_text_layer() -> None:
+    print("8. 얇은 텍스트 레이어 감지")
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = f"{tmp}/scan.pdf", f"{tmp}/out.pdf"
+        make_scan_pdf(src)
+        report = redact(src, dst, no_ocr=True)
+        check(any("얇" in w for w in report["warnings"]),
+              "스캔본에 --no-ocr 면 경고를 낸다", str(report["warnings"]))
+    # 본문이 충분한 문서에는 이 경고가 붙지 않는다 — 짧은 문서를 스캔본으로 오판하면
+    # 원문 텍스트를 래스터로 갈아 버려 오히려 품질이 떨어진다
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = f"{tmp}/full.pdf", f"{tmp}/out.pdf"
+        make_pdf(FIX_OFFICIAL[0], src)
+        report = redact(src, dst, no_ocr=True)
+        check(not any("얇" in w for w in report["warnings"]),
+              "본문 있는 문서엔 얇은 레이어 경고가 없다", str(report["warnings"]))
+    # 이미지 없는 짧은 문서(1쪽 발췌)도 스캔본으로 보지 않는다
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = f"{tmp}/short.pdf", f"{tmp}/out.pdf"
+        make_pdf(["원고 이영희", "피고 김철수", "위와 같이 판결한다."], src)
+        report = redact(src, dst, no_ocr=True)
+        check(not any("얇" in w for w in report["warnings"]),
+              "이미지 없는 짧은 문서는 스캔본이 아니다", str(report["warnings"]))
+
+
+def test_ocr_metadata_scrub() -> None:
+    """OCR 경유 산출물의 메타데이터 소거.
+
+    ocrmypdf 산출물은 XMP를 항상 쓴다. 문서정보를 먼저 비우고 XMP를 나중에 지우면
+    소거가 무효가 되어 author=실명이 산출물에 남는다(실측 유출). 순서를 고정한다.
+    """
+    import shutil
+    print("9. OCR 경유 메타데이터 소거")
+    if shutil.which("ocrmypdf") is None:
+        print("   (ocrmypdf 없음 — 건너뜀)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = f"{tmp}/scan.pdf", f"{tmp}/out.pdf"
+        make_scan_pdf(src)
+        d = fitz.open(src)
+        d.set_metadata({"author": "홍길동", "title": "내부 검토용"})
+        d.saveIncr()
+        d.close()
+        report = redact(src, dst)
+        check(report["ocr_applied"], "스캔본이 OCR을 탄다")
+        check(not report["residual"], "OCR 경유 잔존 없음", str(report["residual"]))
+        with fitz.open(dst) as o:
+            left = {k: v for k, v in o.metadata.items()
+                    if v and k not in ("format", "encryption")}
+        check(not left, "OCR 경유 산출물 메타데이터 소거", str(left))
 
 
 if __name__ == "__main__":
@@ -341,5 +438,8 @@ if __name__ == "__main__":
     test_end_to_end_out()
     test_pseudo_and_ledger()
     test_ask_roundtrip()
+    test_in_alias_style()
+    test_thin_text_layer()
+    test_ocr_metadata_scrub()
     print(f"\n{_pass} pass / {_fail} fail")
     sys.exit(1 if _fail else 0)

@@ -14,8 +14,28 @@ import os
 
 _ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-# 대장에서 관리하는 유형과 가명 꼴
+# 외부용이 대장으로 관리하는 유형 (구 버전 평면 대장 판별에도 쓴다)
 KINDS = ("PERSON", "ORG", "CASE")
+
+# 유형별 가명 꼴. 유형마다 달라야 한다 — 같은 알파벳 풀을 돌려 쓰면 사람과
+# 주민번호가 모두 'A'가 되어 복원이 뒤섞인다(내부용 alias 표기 실측 결함).
+_ALIAS_FORM = {
+    "PERSON": "{c}",            # 사람은 알파벳만 — 문장에서 가장 자연스럽다
+    "ORG": "{c}사",
+    "CASE": "사건{c}",
+    "RRN": "주민번호{c}",
+    "PHONE": "전화{c}",
+    "ACCOUNT": "계좌{c}",
+    "CARD": "카드{c}",
+    "EMAIL": "이메일{c}",
+    "ADDRESS": "주소{c}",
+    "ADDR_DETAIL": "주소{c}",
+    "PASSPORT": "여권{c}",
+    "BIZNO": "사업자번호{c}",
+    "CORPNO": "법인번호{c}",
+    "DRIVER": "면허번호{c}",
+    "CAR": "차량{c}",
+}
 
 
 def _code(n: int) -> str:
@@ -29,12 +49,7 @@ def _code(n: int) -> str:
 
 
 def _format(kind: str, n: int) -> str:
-    code = _code(n)
-    if kind == "ORG":
-        return f"{code}사"
-    if kind == "CASE":
-        return f"사건{code}"
-    return code
+    return _ALIAS_FORM.get(kind, kind + "{c}").format(c=_code(n))
 
 
 class Ledger:
@@ -53,8 +68,10 @@ class Ledger:
         if data and not any(k in data for k in KINDS):
             self.maps["PERSON"] = dict(data)
             return
-        for kind in KINDS:
-            self.maps[kind].update(data.get(kind) or {})
+        # 내부용 alias 표기는 KINDS 밖의 유형(전화·계좌 등)도 대장에 넣는다
+        for kind, table in data.items():
+            if isinstance(table, dict):
+                self.maps.setdefault(kind, {}).update(table)
 
     def alias(self, kind: str, value: str) -> str:
         """가명 조회·부여. 이미 있으면 그 가명을 그대로 쓴다."""

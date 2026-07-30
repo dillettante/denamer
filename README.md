@@ -8,16 +8,19 @@
 
 ## 두 개의 빌드 — 목적이 정반대입니다
 
-|  | **반출판** `denamer_out.py` | **질의판** `denamer_ask.py` |
+|  | **외부용** `denamer_out.py` | **내부용** `denamer_in.py` |
 |---|---|---|
 | 쓰는 곳 | 밖으로 내보내는 문서 (제출·배포) | 안에서 쓰는 문서 (LLM 질의) |
 | 가역성 | **비가역** — 복원 불가 | **가역** — 매핑표로 복원 |
 | 매핑표 | 없음 (가명화 대장은 선택) | 필수 |
-| 대체어 | 사람이 읽는 형태 (김OO · A사 · 사건A) | 기계가 읽는 토큰 (`[[PERSON_01]]`) |
+| 선택 | 익명화(김OO) / 가명화(A·B·C) | 토큰(`[[PERSON_01]]`) / 가명(A·A사·사건A) |
 | 입·출력 | PDF → PDF | PDF·TXT → 텍스트 + 복원키 |
 
+**내부용에는 익명화가 없습니다.** 김철수와 김민수가 모두 `김OO`이 되면 복원이 원리상
+불가능하기 때문입니다. 내부용은 되돌아오는 표기만 제공합니다.
+
 빌드를 나눈 이유는 안전입니다. 한 도구가 둘을 겸하면 **복원용 매핑표를 산출물과 함께
-보내는 사고**가 언젠가 납니다. 반출판에는 복원 코드 자체가 없어 그 사고가 구조적으로
+보내는 사고**가 언젠가 납니다. 외부용에는 복원 코드 자체가 없어 그 사고가 구조적으로
 불가능합니다.
 
 **탐지 규칙은 두 빌드가 공유합니다**(`detect.py`). 규칙을 두 벌 두면 한쪽만 고쳐 놓고
@@ -30,7 +33,7 @@ PDF 위에 검은 사각형을 얹는 방식은 눈에만 안 보일 뿐, 원본
 `apply_redactions()`로 해당 영역의 **텍스트 객체와 스캔 이미지 픽셀 자체를 삭제**한 뒤
 그 자리에 표시(검은 박스 또는 대체어)를 그립니다. 저장된 PDF에서 원문 복원은 불가능합니다.
 
-## 반출판 — 두 가지 모드
+## 외부용 — 두 가지 모드
 
 | | 익명화 `--mode anon` (기본) | 가명화 `--mode pseudo` |
 |---|---|---|
@@ -60,25 +63,30 @@ python3 -m venv --system-site-packages venv
 # 스캔 PDF 자동 OCR을 쓰려면: brew install ocrmypdf  (tesseract kor 포함)
 ```
 
-### 반출판
+### 외부용
 
 ```bash
 ./venv/bin/python denamer_out.py 문서.pdf                 # 익명화 → 문서_masked.pdf
 ./venv/bin/python denamer_out.py 문서.pdf --mode pseudo   # 가명화 → 문서_aliased.pdf
 ./venv/bin/python denamer_out.py 문서.pdf --skip ORG,CASE # 법인명·사건번호는 건드리지 않기
 ./venv/bin/python denamer_out.py 문서.pdf --names 인명사전.txt
+./venv/bin/python denamer_out.py 문서.pdf --no-ocr        # 스캔본에도 OCR 안 함(경고 붙음)
 ```
 
-### 질의판
+### 내부용
 
 ```bash
-./venv/bin/python denamer_ask.py mask 문서.pdf
-#   → 문서_질의용.txt            (LLM에 붙여 넣을 것)
+./venv/bin/python denamer_in.py mask 문서.pdf                  # 토큰 표기(기본)
+./venv/bin/python denamer_in.py mask 문서.pdf --style alias     # 가명 표기(A·A사·사건A)
+#   → 문서_내부용.txt            (LLM에 붙여 넣을 것)
 #   → 문서_복원키(원문포함).json  (외부 전달 금지)
 
-./venv/bin/python denamer_ask.py restore 답변.txt -k '문서_복원키(원문포함).json'
+./venv/bin/python denamer_in.py restore 답변.txt -k '문서_복원키(원문포함).json'
 #   → 답변_복원.txt
 ```
+
+토큰 표기는 원문과 충돌할 일이 없어 가장 안전합니다. 가명 표기는 사람과 LLM이 읽기
+자연스럽지만 맨몸 문자열이라, 원문에 이미 `A`가 쓰였으면 자동으로 `A2`로 비켜 갑니다.
 
 ### 검사
 
@@ -88,7 +96,10 @@ python3 -m venv --system-site-packages venv
 ```
 
 - 원본 파일은 절대 수정하지 않습니다.
-- 텍스트 레이어 없는 순수 스캔 PDF는 `ocrmypdf`(kor+eng)를 자동 실행한 뒤 처리합니다.
+- 스캔 PDF는 `ocrmypdf`(kor+eng)를 자동 실행한 뒤 처리합니다. 텍스트 레이어가 아예
+  없을 때는 물론이고, **레이어가 있어도 쪽당 글자수가 적고 이미지가 쪽을 덮고 있으면**
+  스캔본으로 보고 전 쪽을 다시 읽습니다(도장·머리글만 텍스트인 문서). 이 판단이 없으면
+  그런 문서가 탐지 0건으로 통과합니다.
 - `ko-pii` 미설치 시 정규식·규칙 탐지만으로 동작합니다.
 - 종료 코드: 잔존·매핑실패가 있으면 **1** — 이때 출력물을 신뢰하지 마세요.
 
@@ -97,7 +108,7 @@ python3 -m venv --system-site-packages venv
 단일 HTML 파일 —
 [**여기서 내려받아**](https://raw.githubusercontent.com/dillettante/denamer/main/denamer.html)
 브라우저에서 열고 PDF를 끌어놓으면 끝. 설치 불요, 오프라인 동작, 파일은 어디로도
-전송되지 않습니다. 반출판 계열이며(복원 없음), 페이지를 이미지로 재조립하므로 출력에
+전송되지 않습니다. 외부용 계열이며(복원 없음), 페이지를 이미지로 재조립하므로 출력에
 텍스트 레이어 자체가 없습니다(검색 불가, 대신 복원도 불가능).
 
 웹판의 탐지 규칙·사전은 **파이썬 코어에서 생성**합니다(`python sync_web.py`).
@@ -138,9 +149,9 @@ detect.py            탐지 규칙 + 검증기 + ko-pii 통합   ← 두 빌드�
 names.py             이름 문맥 규칙
 stopwords.py         비이름 사전 (700여 단어)
 ledger.py            가명 대장 (유형별: 사람·법인·사건)
-denamer_out.py       반출판 — PDF 비가역 비실명화
-denamer_ask.py       질의판 — 텍스트 마스킹·복원
-denamer.html         웹판 (반출판 계열, 단일 파일)
+denamer_out.py       외부용 — PDF 비가역 비실명화
+denamer_in.py        내부용 — 텍스트 마스킹·복원
+denamer.html         웹판 (외부용 계열, 단일 파일)
 sync_web.py          웹판 규칙 생성기
 test_denamer.py      회귀 테스트
 check_web_parity.sh  웹판↔코어 대조

@@ -886,10 +886,21 @@ document.querySelectorAll('input[name=mode]').forEach(r =>
     $("ledgerBox").style.display = r.value === "pseudo" && r.checked ? "" : "none";
     renderLedger();
   }));
+// 대장은 유형별 2단 구조다({PERSON:{실명:가명}, ORG:{}, CASE:{}}).
+// 평면 구조로 다루면 표에 "PERSON | [object Object]"가 찍힌다.
+const KIND_LABEL = { PERSON: "사람", ORG: "법인", CASE: "사건" };
+function ledgerCount(l) {
+  return Object.values(l).reduce((n, t) => n + Object.keys(t || {}).length, 0);
+}
 function renderLedger() {
-  const entries = Object.entries(ledger);
-  $("ledgerView").innerHTML = entries.length
-    ? "<table class='ledger'>" + entries.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("") + "</table>"
+  const rows = [];
+  for (const kind of ["PERSON", "ORG", "CASE"]) {
+    for (const [real, alias] of Object.entries(ledger[kind] || {})) {
+      rows.push(`<tr><td>${KIND_LABEL[kind]}</td><td>${real}</td><td>${alias}</td></tr>`);
+    }
+  }
+  $("ledgerView").innerHTML = rows.length
+    ? "<table class='ledger'>" + rows.join("") + "</table>"
     : "<span class='note'>대장이 비어 있습니다 — 실행하면 자동으로 채워집니다</span>";
 }
 $("ledgerExport").onclick = () => {
@@ -900,13 +911,23 @@ $("ledgerExport").onclick = () => {
 $("ledgerImport").onclick = () => $("ledgerFile").click();
 $("ledgerFile").addEventListener("change", async e => {
   if (!e.target.files[0]) return;
-  ledger = JSON.parse(await e.target.files[0].text());
-  localStorage.setItem("denamer_ledger", JSON.stringify(ledger));
-  renderLedger(); log("가명 대장 불러옴: " + Object.keys(ledger).length + "명");
+  let loaded;
+  try { loaded = JSON.parse(await e.target.files[0].text()); }
+  catch (err) { log("대장 불러오기 실패: JSON 형식이 아닙니다"); return; }
+  // 구 버전 평면 대장({"홍길동":"A"})도 받아 사람 대장으로 읽는다
+  const typed = (loaded.PERSON || loaded.ORG || loaded.CASE)
+    ? { ...EMPTY_LEDGER(), ...loaded } : { ...EMPTY_LEDGER(), PERSON: loaded };
+  ledger = typed;
+  localStorage.setItem(LEDGER_KEY, JSON.stringify(ledger));
+  renderLedger(); log("가명 대장 불러옴: " + ledgerCount(ledger) + "건");
 });
 $("ledgerClear").onclick = () => {
   if (!confirm("가명 대장을 비우면 다음 실행부터 가명이 A부터 다시 시작됩니다. 계속?")) return;
-  ledger = {}; localStorage.removeItem("denamer_ledger"); renderLedger();
+  ledger = EMPTY_LEDGER();
+  sessionLedger = EMPTY_LEDGER();
+  localStorage.removeItem(LEDGER_KEY);
+  localStorage.removeItem("denamer_ledger");   // 구 버전 키까지 지운다
+  renderLedger();
 };
 
 // ── 본 처리 ──
@@ -973,12 +994,11 @@ async function process() {
       const repl = replacementFor(label, value, mode);
       const compactVal = value.replace(/\s+/g, "");
       if (!pg.pageStr.includes(value) && !compactStr.includes(compactVal)) continue;
-      // 값과 겹치는 아이템 찾기: 리터럴 위치 + 압축 매칭 겸용
-      const hitItems = findItems(pg, value, compactVal);
-      if (!hitItems.length) continue;
+      // 값과 겹치는 '문자 구간' 찾기: 리터럴 위치 + 압축 매칭 겸용
+      const spans = findSpans(pg, value, compactVal);
+      if (!spans.length) continue;
       unmapped.delete(label + ":" + value);
-      // 같은 줄 인접 아이템은 한 박스로 봉합
-      for (const group of groupItems(hitItems)) pg.masks.push({ group, repl });
+      pg.masks.push({ spans, repl });
     }
   }
 
@@ -994,15 +1014,21 @@ async function process() {
     const ctx = canvas.getContext("2d");
     // intent:"print" — rAF 분할 없이 한 번에 렌더. 탭이 백그라운드여도 멈추지 않는다
     await pg.page.render({ canvasContext: ctx, viewport, intent: "print" }).promise;
-    for (const { group, repl } of pg.masks) {
-      const r = groupRect(group, viewport);
-      ctx.fillStyle = repl === null ? "#000" : "#fff";
-      ctx.fillRect(r.x - 2, r.y - 2, r.w + 4, r.h + 4);
-      if (repl !== null) {
-        ctx.fillStyle = "#111";
-        ctx.font = `${Math.max(10, r.h * 0.72)}px "Apple SD Gothic Neo","Malgun Gothic",sans-serif`;
-        ctx.textBaseline = "middle";
-        ctx.fillText(repl, r.x + 2, r.y + r.h / 2, r.w);
+    for (const { spans, repl } of pg.masks) {
+      for (const r of mergeRects(spans.map(s => spanRect(s, viewport)))) {
+        ctx.fillStyle = repl === null ? "#000" : "#fff";
+        // 가로 여백을 넉넉히 준다 — 글자 폭 측정과 실제 PDF 서체가 미세하게 달라
+        // 박스 끝에 획 조각이 남는다(실측). 구간이 이미 공백까지 확장돼 있으므로
+        // 이 여백은 공백 안으로 떨어지고 이웃 글자를 먹지 않는다.
+        ctx.fillRect(r.x - 3, r.y - 2, r.w + 7, r.h + 4);
+        if (repl !== null) {
+          const text = withTail(repl, r.tail);
+          ctx.fillStyle = "#111";
+          ctx.font = `${Math.max(10, r.h * 0.72)}px "Apple SD Gothic Neo","Malgun Gothic",sans-serif`;
+          ctx.textBaseline = "middle";
+          // 대체어가 박스보다 넓으면 canvas가 눌러 그린다(maxWidth) — 잘리지 않는다
+          ctx.fillText(text, r.x + 1, r.y + r.h / 2, Math.max(r.w, r.h));
+        }
       }
     }
     const wPt = viewport.width * 72 / (96 * SCALE) * SCALE / 2;  // px→pt 근사
@@ -1031,53 +1057,139 @@ async function process() {
   log(`완료 — ${resultName}`);
 }
 
-// 값 문자열과 겹치는 텍스트 아이템 수집 (리터럴 + 압축 양쪽)
-function findItems(pg, value, compactVal) {
-  const hits = [];
-  // 리터럴: pageStr 위치 → 아이템 범위
+// 값과 겹치는 부분을 **아이템 안의 문자 구간**으로 수집한다.
+//   pdf.js의 텍스트 아이템은 글자가 아니라 '텍스트 런'이고, 한 줄이 아이템 하나인
+//   경우가 흔하다. 그래서 아이템을 통째로 반환하면 값이 있던 줄이 전부 지워진다
+//   (실측: 판결문에서 '손해배상(기)'·'소송대리인'·주문 제1항 본문이 사라졌다).
+//   반환 형태: [{it, s, e}] — it.str[s..e)가 지울 구간이다.
+function findSpans(pg, value, compactVal) {
+  const spans = [];
+  const push = (it, s, e) => {
+    s = Math.max(0, s); e = Math.min(it.str.length, e);
+    if (e <= s) return;
+    // 구간을 아이템 안의 **단어 경계까지** 넓힌다.
+    //   글자 폭을 글자수로 비례 배분하는 추정이라 구간 끝이 글자 중간에 떨어지면
+    //   원문 획이 남는다(실측: '김철수'가 '김OO블수'로 보였다 — 시각적 유출).
+    //   경계를 공백까지 밀면 추정 오차가 공백 안으로 떨어져 글자가 온전히 덮인다.
+    //   데스크톱판이 단어박스로 확장하는 것과 같은 취지다.
+    let ws = s, we = e;
+    while (ws > 0 && !/\s/.test(it.str[ws - 1])) ws--;
+    while (we < it.str.length && !/\s/.test(it.str[we])) we++;
+    // 값 뒤에 함께 덮인 글자(대개 조사)는 대체어 뒤에 다시 그려 준다.
+    // 그러지 않으면 '김OO에게 책임이 있다'가 '김OO 책임이 있다'가 되어 뜻이 달라진다.
+    const tail = it.str.slice(e, we);
+    spans.push({ it, s: ws, e: we,
+                 tail: /^[가-힣]{1,3}$/.test(tail) ? tail : "" });
+  };
+  // 리터럴: pageStr 위치 → 아이템별 지역 오프셋
   let i = -1;
   while ((i = pg.pageStr.indexOf(value, i + 1)) !== -1) {
     const end = i + value.length;
-    for (const it of pg.items)
-      if (it.start < end && it.start + it.str.length + 1 > i) hits.push(it);
+    for (const it of pg.items) {
+      if (it.start >= end || it.start + it.str.length <= i) continue;
+      push(it, i - it.start, end - it.start);
+    }
   }
-  // 압축: 공백 제거 문자열에서 찾고 문자→아이템 역매핑
+  // 압축: 공백 제거 문자열에서 찾고 (아이템, 문자) 역매핑
   if (compactVal.length >= (/[가-힣]/.test(compactVal) ? 3 : 4)) {
-    const map = [];
+    const map = [];      // 압축문자 → [아이템번호, 아이템 내 문자번호]
     let compact = "";
     pg.items.forEach((it, idx) => {
-      const t = it.str.replace(/\s+/g, "");
-      compact += t;
-      for (let k = 0; k < t.length; k++) map.push(idx);
+      for (let k = 0; k < it.str.length; k++) {
+        if (/\s/.test(it.str[k])) continue;
+        compact += it.str[k];
+        map.push([idx, k]);
+      }
     });
     let j = -1;
-    while ((j = compact.indexOf(compactVal, j + 1)) !== -1)
-      for (const idx of new Set(map.slice(j, j + compactVal.length)))
-        hits.push(pg.items[idx]);
+    while ((j = compact.indexOf(compactVal, j + 1)) !== -1) {
+      const byItem = new Map();
+      for (const [idx, k] of map.slice(j, j + compactVal.length)) {
+        const cur = byItem.get(idx);
+        byItem.set(idx, cur ? [Math.min(cur[0], k), Math.max(cur[1], k)] : [k, k]);
+      }
+      for (const [idx, [s, e]] of byItem) push(pg.items[idx], s, e + 1);
+    }
   }
-  return [...new Set(hits)];
+  return spans;
 }
-// 같은 줄(세로 겹침)·인접 아이템을 그룹으로
-function groupItems(items) {
-  const groups = [];
-  for (const it of items) {
-    const y = it.transform[5];
-    const g = groups.find(g => Math.abs(g[0].transform[5] - y) < it.height * 0.6);
-    if (g) g.push(it); else groups.push([it]);
+// 문자 구간 → 화면 좌표 박스. 아이템 폭을 글자수로 비례 배분한다.
+//   글자마다 폭이 다른 서체에서는 근사값이지만, 한글 본문에서는 오차가 작고
+//   최종 박스에 여유(±2px)를 두므로 값이 삐져나오지 않는다.
+// 아이템 안 글자별 누적 x 오프셋(0..1 비율). 캐시해 두고 재사용한다.
+//   글자수로 균등 배분하면 안 된다 — 한글은 ASCII의 두 배 폭이라, 숫자가 섞인 줄
+//   ("… 2020. 3. 5. 원고에게 …")에서 박스가 크게 어긋나 원문 획이 드러났다(실측).
+//   canvas로 글자 폭을 재서 실제 비율로 배분한다. 커닝은 무시하지만 오차가 작고,
+//   구간을 단어 경계까지 넓혀 두었으므로 남는 오차는 공백 안으로 떨어진다.
+const _measure = document.createElement("canvas").getContext("2d");
+function charFractions(it) {
+  if (it._frac) return it._frac;
+  _measure.font = "16px 'Apple SD Gothic Neo','Malgun Gothic','Noto Sans KR',sans-serif";
+  const w = [];
+  let sum = 0;
+  for (const ch of it.str) {
+    const cw = _measure.measureText(ch).width || 1;
+    w.push(cw); sum += cw;
   }
-  return groups;
+  const frac = [0];
+  let acc = 0;
+  for (const cw of w) { acc += cw; frac.push(acc / (sum || 1)); }
+  it._frac = frac;
+  return frac;
 }
-function groupRect(group, viewport) {
-  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-  for (const it of group) {
-    const tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
-    const fh = Math.hypot(tx[2], tx[3]);
-    x0 = Math.min(x0, tx[4]);
-    y0 = Math.min(y0, tx[5] - fh);
-    x1 = Math.max(x1, tx[4] + it.width * viewport.scale);
-    y1 = Math.max(y1, tx[5] + fh * 0.25);
+function spanRect(span, viewport) {
+  const { it, s, e, tail } = span;
+  const tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
+  const fh = Math.hypot(tx[2], tx[3]);
+  const w = it.width * viewport.scale;
+  const frac = charFractions(it);
+  const f0 = frac[Math.min(s, frac.length - 1)];
+  const f1 = frac[Math.min(e, frac.length - 1)];
+  return {
+    x: tx[4] + w * f0,
+    y: tx[5] - fh,
+    w: Math.max(w * (f1 - f0), fh * 0.3),
+    h: fh * 1.25,
+    line: tx[5],
+    tail: tail || "",
+  };
+}
+
+// 조사 짝 — 앞이 받침이 있으면 왼쪽, 없으면 오른쪽. 'A사을'이 아니라 'A사를'.
+const JOSA_PAIRS = [["으로서", "로서"], ["으로써", "로써"], ["이라는", "라는"], ["으로", "로"],
+                    ["이라", "라"], ["이며", "며"], ["이고", "고"], ["이나", "나"],
+                    ["은", "는"], ["이", "가"], ["을", "를"], ["과", "와"]];
+function hasBatchim(s) {
+  const c = s.charCodeAt(s.length - 1);
+  // 라틴 문자·숫자는 모음으로 읽는 것이 보통(A 에이 · O 오)
+  return c >= 0xAC00 && c <= 0xD7A3 && (c - 0xAC00) % 28 !== 0;
+}
+function withTail(repl, tail) {
+  if (!tail) return repl;
+  for (const [hard, soft] of JOSA_PAIRS) {
+    if (tail === hard || tail === soft) return repl + (hasBatchim(repl) ? hard : soft);
   }
-  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  return repl + tail;
+}
+// 같은 줄에서 맞닿은 박스는 하나로 봉합한다 — 값이 두 아이템에 걸치면 조각마다
+// 대체어를 그려 글자가 겹치기 때문이다(데스크톱판의 봉합 단계와 같은 취지).
+function mergeRects(rects) {
+  const out = [];
+  for (const r of rects.slice().sort((a, b) => a.line - b.line || a.x - b.x)) {
+    const last = out[out.length - 1];
+    if (last && Math.abs(last.line - r.line) < last.h * 0.6
+        && r.x - (last.x + last.w) < Math.max(6, last.h * 0.5)) {
+      const x1 = Math.max(last.x + last.w, r.x + r.w);
+      last.x = Math.min(last.x, r.x);
+      last.w = x1 - last.x;
+      last.y = Math.min(last.y, r.y);
+      last.h = Math.max(last.h, r.h);
+      last.tail = r.tail || last.tail;   // 오른쪽 조각의 조사가 최종 꼬리다
+    } else {
+      out.push({ ...r });
+    }
+  }
+  return out;
 }
 
 $("download").addEventListener("click", () => {

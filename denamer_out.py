@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""denamer 반출판 — 밖으로 내보내는 PDF를 비가역으로 비실명화한다.
+"""denamer 외부용 — 밖으로 내보내는 PDF를 비가역으로 비실명화한다.
 
 이 빌드에는 **복원 기능이 없다.** 복원용 매핑표를 산출물과 함께 보내는 사고가
-구조적으로 불가능하도록 진입점을 나눈 것이다(질의용은 denamer_ask.py).
+구조적으로 불가능하도록 진입점을 나눈 것이다(질의용은 denamer_in.py).
 
   1. 탐지: detect.py (정규식 + 이름엔진 + ko-pii)
   2. 제거: 값을 페이지에서 전수 검색해 모든 출현을 redact.
@@ -183,25 +183,70 @@ def _with_tail(replacement: str, tail: str) -> str:
     return replacement + tail
 
 
-def _run_ocr(in_path: str) -> str:
-    """텍스트 레이어 없는 순수 스캔 → ocrmypdf로 레이어를 입힌 임시 PDF 경로."""
+# 쪽당 이 글자수 미만이면 '사실상 이미지 문서'로 보고 OCR을 돌린다.
+#
+#   레이어가 조금이라도 있으면 OCR을 건너뛰던 이전 판단이 스캔 문서를 무검사로
+#   통과시켰다. 실측(비실명 샘플): 10쪽 감정서가 729자(쪽당 73자)뿐인데 탐지 0건으로
+#   'OK'가 나왔다 — 사용자는 개인정보가 없다고 믿게 된다.
+#
+#   문턱값은 실측한 분포에서 골랐다. 쪽당 글자수가 두 무리로 확연히 갈린다.
+#     머리글·꼬리글만 있는 스캔본   62 · 73 · 133   (152쪽 감정서는 전 쪽이 정확히
+#                                                  133자 — 매쪽 반복되는 상용구다)
+#     본문이 실제로 있는 문서        606 · 1,499     (준비서면 · 서증)
+#   그 사이인 300을 쓴다. 낮추면 스캔본을 놓치고, 크게 올리면 본문 있는 문서까지
+#   불필요하게 OCR한다.
+THIN_LAYER_PER_PAGE = 300
+
+
+def _layer_density(doc, text: str) -> float:
+    return len(text.strip()) / max(1, doc.page_count)
+
+
+def _image_page_ratio(doc) -> float:
+    """쪽 면적의 절반 이상을 이미지가 덮는 쪽의 비율.
+
+    글자수만으로는 '짧은 문서'와 '이미지 문서'를 가를 수 없다. 1쪽짜리 판결문
+    발췌는 정당하게 250자일 수 있고, 그것까지 OCR하면 원문 텍스트를 래스터로
+    갈아 버려 오히려 품질이 떨어진다(실측: 픽스처가 OCR을 타면서 대체어가 깨졌다).
+    스캔본은 쪽마다 큰 이미지가 깔려 있다는 점이 확실한 구분점이다.
+    """
+    hits = 0
+    for page in doc:
+        page_area = abs(page.rect)
+        if not page_area:
+            continue
+        img_area = sum(abs(fitz.Rect(b["bbox"])) for b in page.get_text("dict")["blocks"]
+                       if b.get("type") == 1)
+        if img_area / page_area > 0.5:
+            hits += 1
+    return hits / max(1, doc.page_count)
+
+
+def _run_ocr(in_path: str, *, force: bool) -> str:
+    """스캔 PDF에 텍스트 레이어를 입힌 임시 PDF 경로.
+
+    force=True면 --force-ocr로 전 쪽을 다시 읽는다. 레이어가 얇은 문서는 쪽마다
+    도장·머리글 텍스트가 조금씩 있어서, --skip-text를 쓰면 그 쪽들을 건너뛰고
+    본문은 그대로 못 읽는다.
+    """
     import shutil
     import subprocess
     import tempfile
     if shutil.which("ocrmypdf") is None:
-        raise SystemExit("스캔 PDF(텍스트 레이어 없음) — ocrmypdf 설치 후 재시도 "
+        raise SystemExit("스캔 PDF(텍스트 레이어 없음/부족) — ocrmypdf 설치 후 재시도 "
                          "(brew install ocrmypdf) 또는 OCR 선행 필요")
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
     print("[denamer] 스캔 PDF 감지 — ocrmypdf 실행 중 (쪽수에 따라 수 분)", file=sys.stderr)
-    subprocess.run(["ocrmypdf", "-l", "kor+eng", "--skip-text", "--optimize", "0",
-                    in_path, tmp],
+    subprocess.run(["ocrmypdf", "-l", "kor+eng",
+                    "--force-ocr" if force else "--skip-text",
+                    "--optimize", "0", in_path, tmp],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return tmp
 
 
 def redact(in_path: str, out_path: str, mode: str = "anon",
            ledger_path: str | None = None, *,
-           skip=(), extra_names=(), excluded_names=()) -> dict:
+           skip=(), extra_names=(), excluded_names=(), no_ocr: bool = False) -> dict:
     """mode: 'anon' = 익명화(김OO·주소 부분보존) / 'pseudo' = 가명화(A·B·C…).
 
     가명 대장은 pseudo 모드에서만 파일로 유지한다 — 같은 대장을 쓰는 문서끼리
@@ -215,23 +260,33 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
 
     doc = fitz.open(in_path)
     full_text = "".join(page.get_text() for page in doc)
+    warnings: list[str] = []
     ocr_applied = False
     ocr_tmp = None      # OCR 경유 시 임시 PDF — 비실명화 전 원문이므로 종료 시 삭제
-    if not full_text.strip():
+
+    # 레이어가 없거나 '사실상 이미지'면 OCR을 돌린다. 레이어가 조금이라도 있으면
+    # 건너뛰던 이전 판단이 스캔 문서를 통째로 무검사 통과시켰다(위 상수 주석 참조).
+    density = _layer_density(doc, full_text)
+    # 레이어가 아예 없으면 무조건, 있더라도 '얇으면서 이미지가 쪽을 덮는' 경우에 OCR한다
+    thin = (not full_text.strip()
+            or (density < THIN_LAYER_PER_PAGE and _image_page_ratio(doc) >= 0.5))
+    if thin and not no_ocr:
         doc.close()
-        ocr_tmp = _run_ocr(in_path)
+        ocr_tmp = _run_ocr(in_path, force=bool(full_text.strip()))
         doc = fitz.open(ocr_tmp)
         full_text = "".join(page.get_text() for page in doc)
         ocr_applied = True
         if not full_text.strip():
             raise SystemExit("OCR 후에도 텍스트 없음 — 이미지 품질 확인 필요")
+    elif thin:
+        warnings.append(f"텍스트 레이어가 얇다(쪽당 {density:.0f}자)인데 --no-ocr 로 "
+                        f"OCR을 건너뛰었다 — 본문 대부분이 검사되지 않았다.")
 
     # OCR 경유 문서는 '조용히 실패'하기 쉽다. 탐지는 OCR이 읽어낸 글자에만 적용되고,
     # OCR이 놓친 글자는 스캔 이미지에 그대로 남는데 사후검증은 그것을 알지 못한다.
     # 리포트가 residual: [] 이라는 이유로 안전하다고 믿으면 안 된다.
-    warnings: list[str] = []
     if ocr_applied:
-        per_page = len(full_text.strip()) / max(1, doc.page_count)
+        per_page = _layer_density(doc, full_text)
         warnings.append("OCR 경유 — 탐지는 OCR이 읽어낸 글자에만 적용된다. "
                         "OCR이 놓친 글자는 스캔 이미지에 그대로 남는다.")
         if per_page < 400:
@@ -347,8 +402,13 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
 
     # 메타데이터·XMP 소거 — 본문을 다 지워도 Author/Creator(워드 계정명·소속)가
     # 문서 정보와 XMP에 남으면 그게 유출 채널이다
-    doc.set_metadata({})
+    # 순서가 중요하다: XMP를 먼저 지우고 그 다음 문서정보를 비운다.
+    #   거꾸로 하면 XMP가 있는 문서에서 소거가 무효가 된다 — set_metadata({})로 지운
+    #   값이 XMP에서 되살아난다. 실측: OCR 경유 산출물에 author=실명이 그대로 남았다
+    #   (ocrmypdf 산출물은 XMP를 항상 쓴다). 본문을 다 지워도 작성자가 남으면
+    #   그 자체가 유출 채널이다.
     doc.del_xml_metadata()
+    doc.set_metadata({})
     doc.save(out_path, garbage=4, deflate=True)
     doc.close()
     if ocr_tmp and os.path.exists(ocr_tmp):
@@ -404,7 +464,7 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
 def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(
-        description="denamer 반출판 — 외부 제출·배포용 PDF 비실명화(비가역)")
+        description="denamer 외부용 — 외부 제출·배포용 PDF 비실명화(비가역)")
     ap.add_argument("input")
     ap.add_argument("output", nargs="?", default=None,
                     help="생략 시 원본 옆에 접미사 부기: 파일명_masked.pdf / _aliased.pdf")
@@ -419,6 +479,9 @@ def main() -> None:
                     help="사용자 사전 — 규칙이 놓치는 이름을 강제 마스킹(한 줄에 하나)")
     ap.add_argument("--not-names", dest="not_names", default=None,
                     help="사용자 사전 — 반복되는 이름 오탐을 제외(한 줄에 하나)")
+    ap.add_argument("--no-ocr", action="store_true",
+                    help="스캔 PDF에도 OCR을 돌리지 않는다. 본문 대부분이 검사되지 않으므로 "
+                         "리포트에 경고가 붙는다")
     args = ap.parse_args()
 
     skip = [s.strip().upper() for s in args.skip.split(",") if s.strip()]
@@ -438,7 +501,8 @@ def main() -> None:
     report = redact(args.input, output, mode=args.mode, ledger_path=ledger_path,
                     skip=skip,
                     extra_names=load_word_list(args.names),
-                    excluded_names=load_word_list(args.not_names))
+                    excluded_names=load_word_list(args.not_names),
+                    no_ocr=args.no_ocr)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     for w in report["warnings"]:
         print(f"경고: {w}", file=sys.stderr)
