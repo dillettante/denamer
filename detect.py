@@ -11,7 +11,7 @@
 import re
 from collections import namedtuple
 
-from names import CORP_TAIL, detect_names
+from names import CORP_TAIL, LABEL_WORDS, detect_names
 
 # ── 표기 변형 빌딩블록 ──────────────────────────────────────────
 DASH = r"[-−–—―.·]"       # ASCII '-' + 유니코드 마이너스/대시류 + 점
@@ -77,20 +77,26 @@ _ORG_ROLE_BLOCK = (
     r"피의자|피해자|가해자|상대방|대리인|소송대리인|법정대리인|의뢰인|"
     r"대표이사|대표자|대표|이사장|이사|감사|사장|부사장|회장|부회장|"
     r"본부장|실장|센터장|팀장|부장|차장|과장|대리|주임|소장|원장|국장|"
-    r"청장|처장|위원장|담당자|담당|위|같은|해당|당해"
+    r"청장|처장|위원장|담당자|담당|위|같은|해당|당해|"
+    # 지시·자칭어 — '저희 법무법인은'에서 '저희'가 상호로 잡혔다(실측)
+    r"저희|우리|본|당사|귀사|상기|전기|해당"
 )
 _NO_ROLE = rf"(?!(?:{_ORG_ROLE_BLOCK})(?![가-힣]))"
 # 상호는 글자·숫자로 시작한다. 여는 괄호를 허용하면 '(소송대리인 법무법인'처럼
 # 괄호부터 삼켜 정작 상호를 놓친다. 첫 글자만 제한하고 이후엔 괄호를 허용한다.
 _ORG_HEAD = r"[가-힣A-Za-z0-9]"
-_ORG_REST = r"[가-힣A-Za-z0-9·&().-]"
+# '(이하'는 상호가 아니라 약칭 도입구다 — 삼키면 "사단법인 X(이하" 가 한 값이 된다(실측)
+_ORG_REST = r"(?:(?!\(이하)[가-힣A-Za-z0-9·&().-])"
 # 상호 안의 공백은 같은 줄에서만 허용한다. `\s`로 열어 두면 개행을 넘어가
 # 다음 줄 첫 단어까지 상호로 삼킨다 — 실측: "법무법인(유한) 가나" 다음 줄이
 # "주        문"이었는데 '가나\n주'가 한 값으로 잡혀 판결문의 '주문'이 훼손됐다.
 _ORG_NAME = (rf"{_NO_ROLE}{_ORG_HEAD}{_ORG_REST}{{1,29}}?"
              rf"(?:{SP}{_NO_ROLE}{_ORG_HEAD}{_ORG_REST}{{0,19}}?)?")
-_ORG_NAME_COMPACT = rf"{_NO_ROLE}{_ORG_HEAD}{_ORG_REST}{{1,29}}?"
-_ORG_STOP = r"(?=(?:과|와|은|는|이|가|을|를)?(?:\s|[,.;:)\]]|$))"
+# 접미 **앞**에 오는 상호는 글자로 시작해야 한다. 숫자를 허용하면 목록번호를 삼킨다
+# (실측: "(2) 사단법인 …"에서 '2) 사단법인'이 한 법인명으로 잡혔다).
+_ORG_NAME_COMPACT = rf"{_NO_ROLE}[가-힣A-Za-z]{_ORG_REST}{{1,29}}?"
+# 여는 괄호도 멈춤 자리다. 넣지 않으면 '(이하' 앞에서 멈추지 못해 매치 자체가 깨진다
+_ORG_STOP = r"(?=(?:과|와|은|는|이|가|을|를)?(?:\s|[,.;:()\[\]]|$))"
 _COMPANY_SUFFIX = r"주식회사|유한회사|유한책임회사|합자회사|합명회사|사단법인|재단법인|\(주\)|㈜"
 _FIRM_SUFFIX = r"법무법인(?:\(유(?:한)?\))?|노무법인|법률사무소|회계법인|세무법인|법무사사무소|특허법인"
 
@@ -99,7 +105,9 @@ def _org_pattern(suffix: str) -> str:
     """접미 앞·뒤 어느 쪽에 상호가 오든 잡는다(주식회사 동방화학 / 한빛전자 주식회사)."""
     return (rf"(?<![가-힣A-Za-z0-9])(?:(?:{suffix}){SP}*{_ORG_NAME}{_ORG_STOP}"
             rf"|{_ORG_NAME_COMPACT}(?<![과와은는이가을를]){SP}*(?:{suffix})"
-            rf"(?![가-힣A-Za-z0-9]))")
+            # 접미 뒤에 조사가 붙어도 인정한다. `(?![가-힣…])`만 두면 '주식회사와'
+            # 처럼 조사가 붙은 흔한 표기에서 매치가 통째로 깨진다(실측).
+            rf"(?=[과와은는이가을를의도로에]|[^가-힣A-Za-z0-9]|$))")
 
 
 # ── 검증기 ─────────────────────────────────────────────────────
@@ -323,6 +331,16 @@ def _strip_josa(word: str) -> str:
     return word
 
 
+def _after_label(text: str, pos: int) -> bool:
+    """값 바로 앞이 라벨이면 붙어 있어도 독립 출현으로 본다.
+
+    표 서식에서는 라벨과 값이 붙는다 — '참    조서민수님'처럼. 앞 글자가 한글이라는
+    이유로 접미 토막으로 보면 정작 실명을 놓친다(실측: 의견서 머리 표의 서민수 미탐).
+    """
+    before = re.sub(r"\s+", "", text[max(0, pos - 14):pos])
+    return any(before.endswith(w) for w in LABEL_WORDS)
+
+
 def _standalone_occurrence(text: str, value: str) -> bool:
     """이름 값이 문서 어딘가에서 '독립 단어'로 나타나는가.
 
@@ -344,7 +362,7 @@ def _standalone_occurrence(text: str, value: str) -> bool:
         return True
     for m in hits:
         before = text[m.start() - 1:m.start()]
-        if before and "가" <= before <= "힣":
+        if before and "가" <= before <= "힣" and not _after_label(text, m.start()):
             continue
         tail = text[m.end():m.end() + 16]
         if re.match(r"[가-힣]{2}", tail) and not _JOSA_HEAD.match(tail):
@@ -403,6 +421,13 @@ def detect(text: str, *, skip=(), extra_names=(), excluded_names=()) -> list[tup
     # PHONE으로 중복 탐지되면 전수 검색이 무관한 7자리를 과잉 제거한다.
     # 한글 이름엔 적용 금지: '홍길동'⊂'홍길동은'이지만 둘 다 별개 출현을 가진
     # 정당한 타깃이라, 지우면 맨이름 출현이 무방비가 된다(실측 유출 사고).
+    # 라벨의 끝 글자가 상호 앞에 붙어 잡히는 일이 있다 — 자간 라벨 '수    신' 뒤의
+    # '세마피엠씨 주식회사'가 '신세마피엠씨 주식회사'로도 잡혔다(실측).
+    # 앞 한두 글자를 뗀 형태도 법인명으로 잡혔다면 그쪽이 진짜 상호다.
+    orgs = {v for l, v in items if l == "ORG"}
+    items = [(l, v) for l, v in items
+             if not (l == "ORG" and any(v[i:] in orgs for i in (1, 2)))]
+
     return [(l, v) for l, v in items
             if not (any(ch.isdigit() for ch in v)
                     and any(v != w and v in w for _, w in items))]

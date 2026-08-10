@@ -38,7 +38,13 @@ STYLES = ("token", "alias")
 
 
 def _read_text(path: str) -> str:
-    """PDF·TXT·MD를 텍스트로 읽는다. PDF는 텍스트 레이어만 쓴다(내부용은 OCR 없음)."""
+    """PDF·DOCX·TXT·MD를 텍스트로 읽는다. PDF는 텍스트 레이어만 쓴다(내부용은 OCR 없음)."""
+    import docx_io
+    if docx_io.is_docx(path):
+        # 머리글·각주·주석·변경이력까지 함께 읽는다 — 질의에 넣을 텍스트라도
+        # 숨은 자리의 개인정보를 빠뜨리면 그대로 LLM에 넘어간다
+        return docx_io.read_text(path)
+    docx_io.assert_supported(path)
     if path.lower().endswith(".pdf"):
         import fitz
         with fitz.open(path) as doc:
@@ -226,7 +232,7 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     m = sub.add_parser("mask", help="원문 → 내부용 텍스트 + 복원키")
-    m.add_argument("input", help="PDF 또는 텍스트 파일")
+    m.add_argument("input", help="PDF · DOCX · 텍스트 파일")
     m.add_argument("-o", "--output", default=None, help="내부용 텍스트 경로")
     m.add_argument("-k", "--key", default=None, help="복원키 JSON 경로 (원문 포함)")
     m.add_argument("--style", choices=STYLES, default="token",

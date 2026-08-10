@@ -72,7 +72,7 @@ def generate() -> str:
         js_set("SURNAME_STOPWORDS", S.SURNAME_STOPWORDS),
         js_set("RELATION_CONTEXT_STOPWORDS", S.RELATION_CONTEXT_STOPWORDS),
         js_set("NAME_STOPWORDS", S.NAME_STOPWORDS),
-        js_set("LABEL_WORDS", N._LABEL_WORDS),
+        js_set("LABEL_WORDS", N.LABEL_WORDS),
         js_list("COMPOUND_SURNAMES", N.COMPOUND_SURNAMES),
         js_list("JOSA_SUFFIXES", N._JOSA_SUFFIXES),
         js_list("JOSA_ABSORB", sorted(S._JOSA_ABSORB | S._LOC_SUFFIX)),

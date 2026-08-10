@@ -11,6 +11,7 @@
 """
 import json
 import os
+import re
 
 _ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -74,10 +75,21 @@ class Ledger:
                 self.maps.setdefault(kind, {}).update(table)
 
     def alias(self, kind: str, value: str) -> str:
-        """가명 조회·부여. 이미 있으면 그 가명을 그대로 쓴다."""
+        """가명 조회·부여. 이미 있으면 그 가명을 그대로 쓴다.
+
+        공백을 무시하고 대조한다. 같은 법인이 줄바꿈·양쪽정렬 때문에
+        '과학기술인 공제회'와 '과학기술인공제회'로 갈려 적히는 일이 흔한데,
+        그대로 두면 한 회사가 A사와 B사로 나뉘어 문서가 읽히지 않는다.
+        """
         table = self.maps.setdefault(kind, {})
-        if value not in table:
-            table[value] = _format(kind, len(table))
+        if value in table:
+            return table[value]
+        key = re.sub(r"\s+", "", value)
+        for known, alias in table.items():
+            if re.sub(r"\s+", "", known) == key:
+                table[value] = alias          # 표기 변형을 같은 가명에 묶는다
+                return alias
+        table[value] = _format(kind, len({re.sub(r"\s+", "", k) for k in table}))
         return table[value]
 
     def save(self) -> None:

@@ -50,7 +50,11 @@ SURNAME_HEAD = re.compile(rf"^(?:{_COMPOUND_ALT}|{_SINGLE_SURNAME})")
 # 자간 대안('홍 길 동')은 음절 사이 공백을 **정확히 한 칸**으로 고정한다.
 # `[ \t]*`처럼 열어 두면 "성명 홍길동  주민등록번호"에서 공백을 건너뛰어
 # '홍길동주'까지 삼킨다(V2 실측 결함).
-NAME_RX = r"(?:[가-힣]{2,4}|[가-힣](?:[ \t][가-힣]){1,3})"
+# 자간 대안은 **3음절 이상**만 인정한다. 2음절('전 대')은 자간 이름과 평범한 두 단어를
+# 구별할 방법이 없다 — 실측: 의견서의 "검사 전 대가 지급"(검사 前 對價)에서 '전 대'가
+# 검사(檢事) 라벨 뒤 이름으로 잡혔다. 가름이 안 되면 잡지 않는 쪽을 택한다.
+# 대가로 '이 도' 같은 2음절 자간 실명은 놓치지만, 그런 표기 자체가 드물다.
+NAME_RX = r"(?:[가-힣]{2,4}|[가-힣](?:[ \t][가-힣]){2,3})"
 
 # 이름 뒤에서 떼어낼 조사·서술어 (긴 것부터 — 한 번만 뗀다)
 _JOSA_SUFFIXES = (
@@ -121,7 +125,7 @@ _BLOCKED_PREFIX_NAMES = {re.sub(r"\s+", "", label) for label in _PREFIX_LABELS}
 #   실측: 여격 조사 규칙이 "원고에게"의 '원고'를 이름으로 확정했다
 #   ('원'은 성씨 음절, '고'는 이름 음절이라 성씨 게이트를 통과한다).
 #   그 결과 판결문의 '원        고' 라벨이 '원O'로 훼손됐다.
-_LABEL_WORDS = {re.sub(r"\s+", "", label) for label in
+LABEL_WORDS = {re.sub(r"\s+", "", label) for label in
                 (LEGAL_PREFIX_LABELS + GENERAL_PREFIX_LABELS + RELATION_PREFIX_LABELS
                  + LEGAL_SUFFIX_LABELS + GENERAL_SUFFIX_LABELS + HONORIFIC_SUFFIX_LABELS)}
 
@@ -176,7 +180,7 @@ class _NameCollector:
         # 한국 4자 실명은 복성뿐 — 그 외 4자는 '정화비용'류 복합명사다
         if len(cand) == 4 and not cand.startswith(COMPOUND_SURNAMES):
             return False
-        if cand in NAME_STOPWORDS or cand in SURNAME_STOPWORDS or cand in _LABEL_WORDS:
+        if cand in NAME_STOPWORDS or cand in SURNAME_STOPWORDS or cand in LABEL_WORDS:
             return False
         if is_word_plus_josa(cand):                # '진술이'·'김포시'
             return False
@@ -259,6 +263,21 @@ _PAT_GENERAL_PREFIX = re.compile(
 _PAT_RELATION_PREFIX = re.compile(
     rf"(?:^|(?<![가-힣]))(?:{_label_group(RELATION_PREFIX_LABELS)}){_LABEL_SEP}"
     rf"(?P<name>{NAME_RX})")
+# 자간 라벨 — '참    조서민수님', '원    고이영희'처럼 라벨을 벌려 쓰고 값이 바로 붙는 서식.
+#   공문서·의견서의 머리 표(수신·참조·제목)에서 흔하다. 일반 라벨 규칙은 라벨과 이름
+#   사이에 공백이나 콜론을 요구하는데, 이 서식에는 그게 없어 통째로 놓쳤다
+#   (실측: 의견서 머리 표의 '참조 서민수'를 미탐).
+#   글자 사이에 공백이 실제로 있는 라벨만 대상으로 해 구분자를 생략해도 되게 한다 —
+#   자간 라벨 자체가 '표 서식'이라는 강한 신호다.
+def _spaced_wide(value: str) -> str:
+    return r"\s+".join(re.escape(ch) for ch in value)
+
+
+_PAT_WIDE_LABEL = re.compile(
+    rf"(?:^|(?<![가-힣]))"
+    rf"(?:{'|'.join(_spaced_wide(l) for l in sorted(_PREFIX_LABELS, key=len, reverse=True))})"
+    rf"[ \t]*[:：]?[ \t]*(?P<name>{NAME_RX})")
+
 _PAT_LEGAL_SUFFIX = re.compile(
     rf"(?:^|(?<![가-힣]))(?P<name>{NAME_RX})[ \t]+"
     rf"(?:{_label_group(LEGAL_SUFFIX_LABELS)})(?=[{NAME_JOSA_CHARS}]|[^가-힣]|$)")
@@ -308,7 +327,7 @@ def detect_names(text: str, extra_names=(), excluded=()) -> set[str]:
         if c.add(m.start("name"), m.end("name"), _relation_candidate_ok):
             c.add_comma_chain(m.end("name"), _relation_candidate_ok)
 
-    for pat in (_PAT_LEGAL_SUFFIX, _PAT_GENERAL_SUFFIX, _PAT_HONORIFIC,
+    for pat in (_PAT_WIDE_LABEL, _PAT_LEGAL_SUFFIX, _PAT_GENERAL_SUFFIX, _PAT_HONORIFIC,
                 _PAT_PAREN_ID, _PAT_COPULA, _PAT_MASKED_STYLE, _PAT_DATIVE):
         for m in pat.finditer(text):
             c.add(m.start("name"), m.end("name"))

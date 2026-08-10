@@ -16,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import xml.etree.ElementTree as ET
+
 import fitz
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -431,6 +433,167 @@ def test_ocr_metadata_scrub() -> None:
         check(not left, "OCR 경유 산출물 메타데이터 소거", str(left))
 
 
+# ══════════════════════════════════════════════════════════════
+# 7. 종단 (외부용 DOCX)
+# ══════════════════════════════════════════════════════════════
+# DOCX의 위험은 PDF와 다르다. 화면에 안 보이는 자리에 원문이 남는 것이 문제다.
+# 그래서 픽스처를 '숨을 곳'마다 하나씩 심어 만든다.
+_NS = ('xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+       'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
+       'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
+       'mc:Ignorable="wps"')
+
+
+def _p(runs: str) -> str:
+    return f"<w:p>{runs}</w:p>"
+
+
+def _r(text: str) -> str:
+    return f'<w:r><w:t xml:space="preserve">{text}</w:t></w:r>'
+
+
+DOCX_PARTS = {
+    "[Content_Types].xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>',
+    "_rels/.rels":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        '</Relationships>',
+    # 하이퍼링크 대상에 메일 주소 — 본문을 지워도 여기 남으면 유출이다
+    "word/_rels/document.xml.rels":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+        'Target="mailto:gildong.hong@example.go.kr" TargetMode="External"/>'
+        '</Relationships>',
+    "word/document.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document {_NS}><w:body>'
+        # ① 값이 세 run 에 쪼개진 이름 — Word의 기본 동작이다
+        + _p('<w:r><w:t>원고 김</w:t></w:r><w:r><w:t>철</w:t></w:r>'
+             '<w:r><w:t xml:space="preserve">수는 이를 청구한다.</w:t></w:r>')
+        # ② 표 셀
+        + '<w:tbl><w:tr><w:tc>' + _p(_r("주민등록번호 880101-1234567")) + '</w:tc>'
+          '<w:tc>' + _p(_r("연락처 010-1234-5678")) + '</w:tc></w:tr></w:tbl>'
+        # ③ 변경이력 — 삭제된 텍스트가 w:delText 로 파일에 남아 있다
+        + _p('<w:del w:id="1" w:author="최민호" w:date="2026-07-30T00:00:00Z">'
+             '<w:r><w:delText>피고 이영희에게 통지</w:delText></w:r></w:del>'
+             '<w:ins w:id="2" w:author="장서윤" w:date="2026-07-30T00:00:00Z">'
+             '<w:r><w:t>정정함</w:t></w:r></w:ins>')
+        # ④ 텍스트박스 — run 안에 또 단락이 들어간다
+        + _p('<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wps:txbx>'
+             '<w:txbxContent>' + _p(_r("담당 박민수 부장")) + '</w:txbxContent>'
+             '</wps:txbx></w:drawing></mc:Choice></mc:AlternateContent></w:r>')
+        # ⑤ 필드 코드 — 하이퍼링크가 여기에도 문자열로 들어간다
+        + _p('<w:r><w:instrText xml:space="preserve"> HYPERLINK "mailto:gildong.hong@example.go.kr" </w:instrText></w:r>')
+        + '<w:sectPr/></w:body></w:document>',
+    # ⑥ 머리글·바닥글
+    "word/header1.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:hdr {_NS}>' + _p(_r("사건 2020가합12345")) + '</w:hdr>',
+    "word/footer1.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:ftr {_NS}>' + _p(_r("주식회사 동방화학")) + '</w:ftr>',
+    # ⑦ 각주
+    "word/footnotes.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:footnotes {_NS}><w:footnote w:id="2">'
+        + _p(_r("피고인 강서연이다")) + '</w:footnote></w:footnotes>',
+    # ⑧ 주석 — 본문 텍스트 + 작성자 이름(속성)
+    "word/comments.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:comments {_NS}><w:comment w:id="1" w:author="김철수" w:initials="김">'
+        + _p(_r("임차인 정수현 확인 요망")) + '</w:comment></w:comments>',
+    # ⑨ 문서 속성 — 작성자·회사
+    "docProps/core.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<dc:creator>홍길동</dc:creator><cp:lastModifiedBy>김철수</cp:lastModifiedBy>'
+        '<dc:title>내부 검토용</dc:title></cp:coreProperties>',
+    "docProps/app.xml":
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+        '<Company>법무법인(유한) 가나</Company><Manager>장서윤</Manager></Properties>',
+}
+
+
+def make_docx(path: str) -> None:
+    import zipfile
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, body in DOCX_PARTS.items():
+            z.writestr(name, body)
+
+
+def test_docx() -> None:
+    print("7. 종단 — 외부용 DOCX")
+    import zipfile
+    import docx_io
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = f"{tmp}/in.docx", f"{tmp}/out.docx"
+        make_docx(src)
+
+        # 읽기: 숨은 자리가 모두 텍스트로 잡혀야 탐지 대상이 된다
+        text = docx_io.read_text(src)
+        for where, needle in [("본문(쪼개진 run)", "김철수"), ("표", "880101-1234567"),
+                              ("변경이력 삭제분", "이영희"), ("텍스트박스", "박민수"),
+                              ("머리글", "2020가합12345"), ("바닥글", "동방화학"),
+                              ("각주", "강서연"), ("주석", "정수현")]:
+            check(needle in text, f"읽기 누락 [{where}]", repr(needle))
+
+        report = redact(src, dst, mode="anon")
+        check(report["format"] == "docx", "형식 인식")
+        check(not report["unmapped"], "DOCX 매핑 실패 없음", str(report["unmapped"]))
+        check(not report["residual"], "DOCX 자체검증 잔존 없음", str(report["residual"]))
+        check(any("변경이력" in w for w in report["warnings"]), "변경이력 경고")
+
+        # 저장본 raw 전수 검사 — 어느 파트에도 원문이 남으면 안 된다
+        with zipfile.ZipFile(dst) as z:
+            raw = "\n".join(z.read(n).decode("utf-8", "ignore") for n in z.namelist())
+        for needle in ["김철수", "880101-1234567", "010-1234-5678", "이영희", "박민수",
+                       "2020가합12345", "동방화학", "강서연", "정수현",
+                       "gildong.hong", "홍길동", "장서윤", "최민호", "내부 검토용"]:
+            check(needle not in raw, "DOCX 원문 잔존", repr(needle))
+
+        # 쪼개진 run 이 제대로 합쳐졌는지 — 가운데 조각이 남는 유형의 결함 확인
+        out_text = docx_io.read_text(dst)
+        check("김OO는 이를 청구한다." in out_text,
+              "쪼개진 run 재조립 + 조사 보존", repr(out_text[:60]))
+        check("A사" in out_text, "법인명 가명", repr(out_text))
+        check("사건A" in out_text, "사건번호 가명")
+        check("■■■■" in out_text, "번호류 고정 가림")
+        # 지우지 말아야 할 것
+        for keep in ["이를 청구한다", "확인 요망", "정정함"]:
+            check(keep in out_text, "DOCX 과잉 제거", repr(keep))
+        # 저장본이 열리는 zip 이고 XML 로 파싱되는지
+        with zipfile.ZipFile(dst) as z:
+            check(z.testzip() is None, "저장본 zip 무결성")
+            for n in z.namelist():
+                if n.endswith(".xml") or n.endswith(".rels"):
+                    try:
+                        ET.fromstring(z.read(n))
+                    except ET.ParseError as e:
+                        check(False, f"저장본 XML 파손 [{n}]", str(e))
+
+    # 미지원 형식은 조용히 실패하지 않고 분명히 막는다
+    for suffix in (".doc", ".hwp", ".xlsx"):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / f"x{suffix}"
+            p.write_bytes(b"dummy")
+            try:
+                redact(str(p), f"{tmp}/o.pdf")
+                check(False, f"{suffix} 차단 실패")
+            except SystemExit:
+                check(True, f"{suffix} 차단")
+
+
 if __name__ == "__main__":
     test_detection()
     test_skip_and_dictionary()
@@ -441,5 +604,6 @@ if __name__ == "__main__":
     test_in_alias_style()
     test_thin_text_layer()
     test_ocr_metadata_scrub()
+    test_docx()
     print(f"\n{_pass} pass / {_fail} fail")
     sys.exit(1 if _fail else 0)

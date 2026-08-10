@@ -19,6 +19,8 @@ import sys
 
 import fitz  # PyMuPDF
 
+import docx_io
+
 from detect import LABEL_NAMES, REGIONS, SKIPPABLE, detect, load_word_list
 from ledger import Ledger
 
@@ -244,10 +246,56 @@ def _run_ocr(in_path: str, *, force: bool) -> str:
     return tmp
 
 
+# DOCX에는 검은 박스가 없다. 번호류는 고정 길이로 가려 글자수까지 숨긴다
+# (길이를 남기면 '몇 자리 계좌인지'가 새고, 값마다 길이가 달라 대조가 쉬워진다).
+FIXED_MASK = "■■■■"
+
+
+def _docx_replacement(label: str, value: str, mode: str, ledger: Ledger) -> str:
+    repl = _replacement_for(label, value, mode, ledger)
+    return FIXED_MASK if repl is None else repl
+
+
+def _redact_docx(in_path: str, out_path: str, mode: str, ledger_path: str | None, *,
+                 skip, extra_names, excluded_names) -> dict:
+    """DOCX 비실명화. 좌표가 아니라 OOXML 파트를 직접 고친다(docx_io 참조)."""
+    ledger = Ledger(ledger_path if mode == "pseudo" else None)
+    full_text = docx_io.read_text(in_path)
+    if not full_text.strip():
+        raise SystemExit("텍스트가 없는 DOCX — 내용이 그림뿐인지 확인 필요. "
+                         "스캔 이미지를 넣은 문서라면 PDF로 내보낸 뒤 처리할 것.")
+
+    targets = detect(full_text, skip=skip, extra_names=extra_names,
+                     excluded_names=excluded_names)
+    result = docx_io.mask_docx(in_path, out_path, targets,
+                               lambda l, v: _docx_replacement(l, v, mode, ledger),
+                               full_text)
+    if mode == "pseudo":
+        ledger.save()
+
+    return {
+        "format": "docx",
+        "mode": mode,
+        "ocr_applied": False,
+        "ledger": ledger_path if mode == "pseudo" else None,
+        "targets": len(targets),
+        "boxes_applied": result["boxes_applied"],
+        "unmapped": result["unmapped"],                     # 비어야 정상
+        "residual": docx_io.scan_residual(out_path, targets),  # 비어야 정상
+        "warnings": result["warnings"],
+        "by_label": sorted({LABEL_NAMES.get(l, l) for l, _ in targets}),
+        "persons": sorted(v for l, v in targets if l in ("PERSON", "NAME")),
+        "orgs": sorted(v for l, v in targets if l == "ORG"),
+    }
+
+
 def redact(in_path: str, out_path: str, mode: str = "anon",
            ledger_path: str | None = None, *,
            skip=(), extra_names=(), excluded_names=(), no_ocr: bool = False) -> dict:
     """mode: 'anon' = 익명화(김OO·주소 부분보존) / 'pseudo' = 가명화(A·B·C…).
+
+    PDF와 DOCX를 받는다. 형식마다 '지운다'의 의미가 다르다 — PDF는 좌표를 찾아
+    apply_redactions로 객체를 삭제하고, DOCX는 XML 파트의 텍스트를 바꿔 쓴다.
 
     가명 대장은 pseudo 모드에서만 파일로 유지한다 — 같은 대장을 쓰는 문서끼리
     같은 사람이 항상 같은 가명을 받는다(문서 교차 시 인물 동일성 유지).
@@ -255,6 +303,11 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     """
     if mode not in ("anon", "pseudo"):
         raise ValueError(f"mode는 anon|pseudo: {mode}")
+    if docx_io.is_docx(in_path):
+        return _redact_docx(in_path, out_path, mode, ledger_path, skip=skip,
+                            extra_names=extra_names, excluded_names=excluded_names)
+    docx_io.assert_supported(in_path)   # .doc·.hwp·.xlsx·.pptx를 분명히 막는다
+
     # 익명화 모드에서도 법인·사건번호에는 가명이 필요하다. 다만 파일로는 남기지 않는다.
     ledger = Ledger(ledger_path if mode == "pseudo" else None)
 
@@ -464,10 +517,10 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
 def main() -> None:
     import argparse
     ap = argparse.ArgumentParser(
-        description="denamer 외부용 — 외부 제출·배포용 PDF 비실명화(비가역)")
-    ap.add_argument("input")
+        description="denamer 외부용 — 외부 제출·배포용 PDF·DOCX 비실명화(비가역)")
+    ap.add_argument("input", help="PDF 또는 DOCX")
     ap.add_argument("output", nargs="?", default=None,
-                    help="생략 시 원본 옆에 접미사 부기: 파일명_masked.pdf / _aliased.pdf")
+                    help="생략 시 원본 옆에 접미사 부기: 파일명_masked.<확장자> / _aliased.<확장자>")
     ap.add_argument("--mode", choices=["anon", "pseudo"], default="anon",
                     help="anon=김OO·주소 부분보존(기본) / pseudo=A·B·C 일관 가명")
     ap.add_argument("--ledger", default=None,
