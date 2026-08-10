@@ -64,7 +64,7 @@ PDF 위에 검은 사각형을 얹는 방식은 눈에만 안 보일 뿐, 원본
 | 주소 | 시·도만 보존, 나머지 O | 익명화와 동일 |
 | 번호류 | 검은 박스 완전 삭제 | 익명화와 동일 |
 | 대장 파일 | **남기지 않음** | `pseudonym_ledger.json` |
-| 출력 | `원본명_masked.pdf` | `원본명_aliased.pdf` |
+| 출력 | `원본명_masked.<확장자>` | `원본명_aliased.<확장자>` |
 
 법인명·사건번호는 두 모드 모두 가명으로 바꿉니다. `○○화학`식 부분 가림은 읽기 어렵고,
 같은 법인이 문서 안에서 같은 이름으로 불려야 문장이 성립하기 때문입니다. 다만 익명화
@@ -92,6 +92,7 @@ python3 -m venv --system-site-packages venv
 ./venv/bin/python denamer_out.py 문서.pdf --skip ORG,CASE # 법인명·사건번호는 건드리지 않기
 ./venv/bin/python denamer_out.py 문서.pdf --names 인명사전.txt
 ./venv/bin/python denamer_out.py 문서.pdf --no-ocr        # 스캔본에도 OCR 안 함(경고 붙음)
+./venv/bin/python denamer_out.py 의견서.docx              # DOCX → 의견서_masked.docx
 ```
 
 ### 내부용
@@ -112,8 +113,9 @@ python3 -m venv --system-site-packages venv
 ### 검사
 
 ```bash
-./venv/bin/python test_denamer.py      # 회귀 테스트 199건
+./venv/bin/python test_denamer.py      # 회귀 테스트 256건
 ./check_web_parity.sh                  # 웹판이 코어와 같은 결과를 내는지 대조 (node 필요)
+./check_no_private.sh                  # push 전 개인정보 흔적 검사
 ```
 
 - 원본 파일은 절대 수정하지 않습니다.
@@ -139,13 +141,13 @@ python3 -m venv --system-site-packages venv
 
 ## 탐지 방식
 
-1. **정규식 엔진** — 주민·외국인등록번호(자간·유니코드 대시·무하이픈 허용, 생년월일
+1. **정규식 엔진** (24종) — 주민·외국인등록번호(자간·유니코드 대시·무하이픈 허용, 생년월일
    타당성 검증), 카드(Luhn), 여권, 사업자등록번호(체크섬), 법인등록번호, 운전면허,
    계좌(문맥어 기반), 전화(국번 화이트리스트), 이메일, 차량번호, 사건번호(법원·검찰·
    노동위·조세심판·행정심판·위원회), 법인명, 주소.
-2. **이름 엔진** — 당사자 라벨 100여 종, 친족 관계어, 직함·호칭 접미, 괄호 식별자,
-   서술어 결합, 여격 조사, 이미 부분 마스킹된 표기(김○○). 성씨 게이트와 비이름 사전
-   700여 단어로 오탐을 억제합니다.
+2. **이름 엔진** — 라벨 174종(당사자 81 · 친족 관계어 43 · 직함·호칭 등), 괄호 식별자,
+   서술어 결합, 여격 조사, 자간 라벨(`참    조서민수님`), 이미 부분 마스킹된 표기(김○○).
+   성씨 게이트와 비이름 사전 752단어로 오탐을 억제합니다.
 3. **ko-pii** (형태소 기반, 데스크톱판) — 라벨 없는 자유문장 속 이름·주소.
 4. **제거** — 탐지된 값 문자열을 페이지 전수 검색(리터럴 + 자간 변형 워드 폴백)해 모든
    출현을 삭제. 오프셋→좌표 역매핑을 쓰지 않으므로 그 계열의 좌표 어긋남 버그가
@@ -168,14 +170,16 @@ python3 -m venv --system-site-packages venv
 ```
 detect.py            탐지 규칙 + 검증기 + ko-pii 통합   ← 두 빌드가 공유
 names.py             이름 문맥 규칙
-stopwords.py         비이름 사전 (700여 단어)
+stopwords.py         비이름 사전 (752단어)
 ledger.py            가명 대장 (유형별: 사람·법인·사건)
-denamer_out.py       외부용 — PDF 비가역 비실명화
+docx_io.py           DOCX 파트 읽기·치환·검증 (숨은 자리 포함)
+denamer_out.py       외부용 — PDF·DOCX 비가역 비실명화
 denamer_in.py        내부용 — 텍스트 마스킹·복원
 denamer.html         웹판 (외부용 계열, 단일 파일)
 sync_web.py          웹판 규칙 생성기
 test_denamer.py      회귀 테스트
 check_web_parity.sh  웹판↔코어 대조
+check_no_private.sh  공개 저장소 개인정보 검사
 ```
 
 ## 라이선스
