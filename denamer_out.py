@@ -270,7 +270,9 @@ SHAPE_WARN = (
     ("주민번호", re.compile(r"\d{6}\s*[-−–—―]\s*[1-8]\d{6}")),
     ("사건번호", re.compile(r"(?<![0-9])\d{4}\s*[가-힣]{1,3}\s*\d{2,6}(?![0-9])")),
     ("전화번호", re.compile(r"(?<![0-9])0\d{1,2}[-\s]\d{3,4}[-\s]\d{4}(?![0-9])")),
-    ("계좌·번호열", re.compile(r"(?<![0-9-])\d{2,7}(?:[-\s]\d{2,7}){2,3}(?![0-9-])")),
+    # 앞뒤에 영문자가 붙으면 UUID·해시다(실측: 책갈피의 pc-0a76eb62-4936-43f4-…).
+    # 실제 계좌번호가 글자에 바로 붙는 경우는 없으므로 이 배제로 잃는 것이 없다.
+    ("계좌·번호열", re.compile(r"(?<![0-9A-Za-z-])\d{2,7}(?:[-\s]\d{2,7}){2,3}(?![0-9A-Za-z-])")),
 )
 
 
@@ -291,10 +293,12 @@ def scan_shapes(text: str) -> list[tuple[str, list[str]]]:
 
 
 def _output_text(path: str) -> str:
+    """점검 대상 텍스트 — 본문 밖(주석·책갈피)까지 포함해야 한다.
+    본문만 읽으면 그 자리에 남은 값이 점검을 그대로 통과한다(실측)."""
     if docx_io.is_docx(path):
         return docx_io.read_text(path)
     with fitz.open(path) as d:
-        return "".join(p.get_text() for p in d)
+        return "".join(p.get_text() for p in d) + "\n" + _hidden_text(d)
 
 
 def _finalize(report: dict, out_path: str) -> dict:
@@ -317,6 +321,64 @@ def _finalize(report: dict, out_path: str) -> dict:
         report["warnings"].append(
             f"출력물에 {name} 모양이 {len(hits)}건 남아 있다(오탐 포함) — 확인 필요: {sample}")
     return report
+
+
+def _hidden_text(doc) -> str:
+    """본문 밖에 있어 page.get_text()로는 안 보이는 자리의 텍스트.
+
+    주석(검토 코멘트)·책갈피 제목은 본문을 다 지워도 그대로 남는다. 실측: 본문의
+    주민번호는 지워졌는데 팝업 주석의 '검토자 … 010-…'과 책갈피의 실명이 남고,
+    residual 도 warnings 도 비어 exit 0 이었다. 검토 코멘트가 달린 PDF를 그대로
+    내보내는 것은 흔한 사고 유형이다.
+    """
+    parts = []
+    for page in doc:
+        for a in page.annots():
+            info = a.info or {}
+            parts += [info.get("content") or "", info.get("title") or "",
+                      info.get("subject") or ""]
+    parts += [t[1] for t in (doc.get_toc() or [])]
+    return "\n".join(p for p in parts if p)
+
+
+def _scrub_hidden(doc, repl_of) -> list[str]:
+    """주석은 지우고, 책갈피 제목은 본문과 같은 규칙으로 가린다.
+
+    주석은 content 말고도 /RC(리치텍스트)와 외형 스트림에 같은 글자를 들고 있어
+    부분 치환으로는 확실히 지웠다고 말할 수 없다 — 통째로 삭제한다. 첨부파일도
+    바이너리라 부분 마스킹이 불가능하므로 삭제한다.
+    """
+    notes = []
+    n_annot = 0
+    for page in doc:
+        for a in list(page.annots() or []):
+            page.delete_annot(a)
+            n_annot += 1
+    if n_annot:
+        notes.append(f"주석 {n_annot}건을 삭제했다(검토 코멘트는 부분 마스킹이 "
+                     f"불가능해 통째로 지운다) — 원본에서 내용을 확인할 것.")
+
+    toc = doc.get_toc() or []
+    if toc:
+        changed = False
+        for entry in toc:
+            masked = repl_of(entry[1])
+            if masked != entry[1]:
+                entry[1] = masked
+                changed = True
+        if changed:
+            doc.set_toc(toc)
+            notes.append("책갈피 제목에 개인정보가 있어 가렸다.")
+
+    try:
+        n_files = doc.embfile_count()
+    except Exception:
+        n_files = 0
+    for i in range(n_files - 1, -1, -1):
+        doc.embfile_del(i)
+    if n_files:
+        notes.append(f"첨부파일 {n_files}건을 삭제했다(내용을 검사할 수 없다).")
+    return notes
 
 
 def _redact_docx(in_path: str, out_path: str, mode: str, ledger_path: str | None, *,
@@ -411,8 +473,9 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
             warnings.append(f"OCR 추출량이 적다(쪽당 {per_page:.0f}자) — 본문의 상당 부분을 "
                             f"읽지 못했을 수 있다. 원본 대조 육안 검토 없이 배포 금지.")
 
-    targets = detect(full_text, skip=skip, extra_names=extra_names,
-                     excluded_names=excluded_names)
+    # 주석·책갈피에만 있는 값도 탐지 대상이다 — 본문에 없다고 안 지우면 그대로 남는다
+    targets = detect(full_text + "\n" + _hidden_text(doc), skip=skip,
+                     extra_names=extra_names, excluded_names=excluded_names)
 
     # 성능 가드: search_for는 비싸다(실측 64쪽×477타깃 = 5분 초과).
     # 쪽별 텍스트를 한 번만 뽑아 두고, 조각이 그 쪽에 실재할 때만 검색한다.
@@ -525,6 +588,17 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     #   값이 XMP에서 되살아난다. 실측: OCR 경유 산출물에 author=실명이 그대로 남았다
     #   (ocrmypdf 산출물은 XMP를 항상 쓴다). 본문을 다 지워도 작성자가 남으면
     #   그 자체가 유출 채널이다.
+    # 본문 밖(주석·책갈피·첨부)은 apply_redactions 가 손대지 않는다
+    def _repl_of(s: str) -> str:
+        out = s
+        for label, value in targets:
+            r = _replacement_for(label, value, mode, ledger)
+            if value in out:
+                out = out.replace(value, r if r is not None else "○" * len(value))
+        return out
+
+    warnings.extend(_scrub_hidden(doc, _repl_of))
+
     doc.del_xml_metadata()
     doc.set_metadata({})
     doc.save(out_path, garbage=4, deflate=True)
@@ -536,11 +610,17 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
 
     # ── 사후검증: 저장본 재오픈 → 재검색 ──
     saved = fitz.open(out_path)
-    saved_text = "".join(page.get_text() for page in saved)
+    saved_text = ("".join(page.get_text() for page in saved)
+                  + "\n" + _hidden_text(saved))
     leftover_meta = {k: v for k, v in (saved.metadata or {}).items()
                      if v and k not in ("format", "encryption")}
     saved.close()
     compact_saved = re.sub(r"\s+", "", saved_text)
+    # 주석·책갈피에만 있던 값은 본문 좌표에 안 잡혀 unmapped 로 남지만, 그 자리를
+    # 지웠으므로 실패가 아니다. 출력물 어디에도 없으면 처리된 것으로 본다 —
+    # 거짓 exit 1을 방치하면 진짜 실패까지 함께 무시하게 된다.
+    unmapped = [u for u in unmapped
+                if re.sub(r"\s+", "", u.split(":", 1)[1]) in compact_saved]
     # 우리가 일부러 그려 넣은 대체어는 잔존이 아니다. 이걸 빼지 않으면 보존한
     # 시·도 토큰이 다른 값의 조각과 겹칠 때 거짓 실패가 난다.
     inserted = {r for jobs in merged_jobs.values() for _, r in jobs if r}
