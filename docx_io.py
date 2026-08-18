@@ -37,6 +37,8 @@ TEXT_TAGS = {f"{{{W}}}t", f"{{{W}}}delText", f"{{{W}}}instrText"}
 XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 # 본문 텍스트가 들어 있는 파트
+_THUMB_RX = re.compile(r"docProps/thumbnail\.\w+$")
+_THUMB_REL_RX = re.compile(rb"<Relationship\b[^>]*thumbnail[^>]*/>")
 _TEXT_PART_RX = re.compile(
     r"^word/(document\d*\.xml|header\d*\.xml|footer\d*\.xml|footnotes\.xml"
     r"|endnotes\.xml|comments\.xml|commentsExtended\.xml)$")
@@ -280,11 +282,18 @@ def mask_docx(src: str, dst: str, targets, repl_for, full_text: str = "") -> dic
 
     hits = 0
     matched: set[str] = set()
+    dropped_thumb: list[str] = []
     with zipfile.ZipFile(src) as zin, \
          zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
-            raw = zin.read(item.filename)
             name = item.filename
+            # 썸네일은 첫 쪽을 렌더한 그림이다 — 실명이 글자가 아니라 픽셀로 박혀
+            # 있어 텍스트 치환이 닿지 않고, scan_residual 도 .xml 만 읽어 모른다.
+            # 부분 마스킹이 불가능하므로 통째로 뺀다(관계도 아래에서 지운다).
+            if _THUMB_RX.match(name):
+                dropped_thumb.append(name)
+                continue
+            raw = zin.read(item.filename)
             if _TEXT_PART_RX.match(name):
                 raw, n = _mask_part(raw, pattern, repl_of, canonical, matched)
                 hits += n
@@ -295,9 +304,14 @@ def mask_docx(src: str, dst: str, targets, repl_for, full_text: str = "") -> dic
                 raw, _ = _mask_part(raw, None, repl_of, canonical, matched)
             elif name.endswith(".rels"):
                 raw = _mask_rels(raw, pattern, repl_of, canonical, matched)
+                # 뺀 썸네일을 가리키는 관계가 남으면 Word가 복구를 시도한다
+                raw = _THUMB_REL_RX.sub(b"", raw)
             zout.writestr(item, raw)
 
     # 탐지는 됐는데 한 번도 치환되지 않은 값 — 단락 경계를 넘어선 값 등
+    if dropped_thumb:
+        warnings.append("미리보기 썸네일(첫 쪽 렌더 이미지)을 삭제했다 — 그림이라 "
+                        "부분 마스킹이 불가능하다.")
     unmapped = [f"{label}:{value}" for label, value in targets if value not in matched]
     return {"boxes_applied": hits, "unmapped": unmapped, "warnings": warnings}
 

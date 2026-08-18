@@ -729,8 +729,11 @@ function detectNames(text) {
   const found = new Set();
   const chainRx = new RegExp(`^[ \\t]*,[ \\t]*(${NAME_RX})`, "d");
   const addName = (start, end, extraOk) => {
-    if (!followingOk(text, end)) return false;
     const raw = text.slice(start, end).replace(/\s+/g, "");
+    // 회사명 앞토막 차단. 후보가 조사로 끝나면 뒤 단어는 별개 토큰이므로 적용하지
+    // 않는다 — 안 그러면 '김철수는 주식회사 …'에서 실명이 통째로 미탐된다.
+    // 파이썬 names.py 의 같은 규칙과 반드시 맞춰 둘 것(생성 대상이 아니라 수작업이다).
+    if (nameCandidates(raw).length === 1 && !followingOk(text, end)) return false;
     for (const c of nameCandidates(raw)) {
       if (!acceptsName(c)) continue;
       if (extraOk && !extraOk(c)) continue;
@@ -789,21 +792,34 @@ function hasContext(text, start, end, words) {
   return words.some(x => w.includes(x));
 }
 
+// 전각 숫자 → ASCII. 한 글자가 한 글자로 바뀌어 오프셋이 그대로다.
+// JS 의 `\d`는 u 플래그와 무관하게 언제나 [0-9]라, 이 변환이 없으면 전각 표기
+// PII 가 웹판에서만 통째로 미탐이다(파이썬 detect.py 와 같은 처리).
+const FULLWIDTH_DIGITS = /[０-９]/g;
+const toAsciiDigits = (s) =>
+  s.replace(FULLWIDTH_DIGITS, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+
 function detect(text) {
   const found = new Map();   // value → label
+  const scan = toAsciiDigits(text);   // 찾기는 사본에서, 값은 원문에서 자른다
   for (const [label, pat, ctx, validator] of RULES) {
     pat.lastIndex = 0;
     let m;
-    while ((m = pat.exec(text)) !== null) {
+    while ((m = pat.exec(scan)) !== null) {
       if (m[0] === "") { pat.lastIndex++; continue; }
-      const value = (m[1] || m[0]).trim();
+      // 1번 그룹이 있으면 그 자리, 없으면 전체 — 원문에서 같은 구간을 잘라 쓴다
+      const gi = m[1] !== undefined ? m[0].indexOf(m[1]) : 0;
+      const s = m.index + (gi < 0 ? 0 : gi);
+      const e = s + (m[1] !== undefined ? m[1].length : m[0].length);
+      const value = text.slice(s, e).trim();
+      const norm = scan.slice(s, e).trim();
       if (value.length < 2) continue;
-      if (ctx && !hasContext(text, m.index, m.index + m[0].length, ctx)) continue;
-      if (validator && !validator(value)) continue;
+      if (ctx && !hasContext(scan, m.index, m.index + m[0].length, ctx)) continue;
+      if (validator && !validator(norm)) continue;
       if (!found.has(value)) found.set(value, label);
     }
   }
-  for (const n of detectNames(text)) if (!found.has(n)) found.set(n, "NAME");
+  for (const n of detectNames(scan)) if (!found.has(n)) found.set(n, "NAME");
   let items = [...found].map(([v, l]) => [l, v]);
   items = items.filter(([l, v]) => !(l === "NAME" && !standalone(text, v)));
   // 숫자 포함 값이 다른 값의 부분문자열이면 제외(주민번호 뒷자리의 전화 오인 등).

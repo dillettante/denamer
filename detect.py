@@ -190,6 +190,9 @@ BR = r"(?![0-9A-Za-z가-힣])"
 BR_CASE = r"(?![0-9A-Za-z])"
 
 
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
 Rule = namedtuple("Rule", "label pattern context validator")
 
 
@@ -403,22 +406,32 @@ def detect(text: str, *, skip=(), extra_names=(), excluded_names=()) -> list[tup
     if "NAME" in skip:
         skip.add("PERSON")
     found: dict[str, str] = {}
+    # 전각 숫자(８８０１０１)는 ASCII로 바꾼 사본에서 찾고, 값은 원문에서 잘라 쓴다.
+    # 전각→ASCII는 한 글자가 한 글자로 바뀌므로 오프셋이 어긋나지 않는다(길이가
+    # 변하는 공백 정규화와 다르다). 사본을 안 쓰면 규칙마다 전각을 다르게 처리한다 —
+    # 실측: `\d`를 쓰는 규칙은 잡고 `[1-8]`·국번 목록을 쓰는 규칙은 못 잡아,
+    # 전각 주민번호가 CORPNO로 오분류되고 전각 전화는 아예 미탐이었다.
+    # 값을 원문에서 자르므로 제거 단계의 '값 전수 검색'도 그대로 성립한다.
+    scan = text.translate(_FULLWIDTH_DIGITS)
 
     for rule in RULES:
         if rule.label in skip:
             continue
-        for m in rule.pattern.finditer(text):
-            value = (m.groupdict().get("v") or m.group(0)).strip()
+        for m in rule.pattern.finditer(scan):
+            g = m.groupdict()
+            span = m.span("v") if g.get("v") is not None else m.span(0)
+            value = text[span[0]:span[1]].strip()
+            norm = scan[span[0]:span[1]].strip()
             if len(value) < 2:
                 continue
-            if rule.context and not _has_context(text, m.start(), m.end(), rule.context):
+            if rule.context and not _has_context(scan, m.start(), m.end(), rule.context):
                 continue
-            if rule.validator and not rule.validator(value):
+            if rule.validator and not rule.validator(norm):
                 continue
             found.setdefault(value, rule.label)
 
     if "NAME" not in skip:
-        for name in detect_names(text, extra_names, excluded_names):
+        for name in detect_names(scan, extra_names, excluded_names):
             found.setdefault(name, "NAME")
         for label, value in _ko_pii_targets(text):
             if label in skip:
