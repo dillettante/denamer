@@ -21,6 +21,7 @@ import fitz  # PyMuPDF
 
 import docx_io
 
+import detect as detect_mod
 from detect import LABEL_NAMES, REGIONS, SKIPPABLE, detect, load_word_list
 from ledger import Ledger
 
@@ -256,6 +257,68 @@ def _docx_replacement(label: str, value: str, mode: str, ledger: Ledger) -> str:
     return FIXED_MASK if repl is None else repl
 
 
+# ── 출력물 모양 점검 ───────────────────────────────────────────
+# residual/unmapped 는 '자기가 탐지한 값'만 출력물에서 다시 찾는다. 미탐은 검증
+# 대상에 애초에 들어가지 않으므로 원리적으로 걸리지 않는다 — 리포트가 깨끗한 것과
+# 문서가 깨끗한 것은 다른 말이다. 그래서 탐지 규칙을 재사용하지 않는, 훨씬 느슨한
+# 패턴을 출력물에 따로 돌린다. 여기 걸린 것이 전부 오탐이어도 목적은 달성된다 —
+# '0건 = 안전'과 '0건 = 규칙이 못 봤음'을 사용자가 구분할 수 있게 하는 것이다.
+#
+# 이름 모양(성씨+2음절)은 넣지 않았다. 일반 문서에서 수백 건씩 걸려 경고가 묻히고,
+# 이름 미탐은 리포트의 persons 목록 + 육안 확인이 담당한다. 필요하면 여기 추가할 것.
+SHAPE_WARN = (
+    ("주민번호", re.compile(r"\d{6}\s*[-−–—―]\s*[1-8]\d{6}")),
+    ("사건번호", re.compile(r"(?<![0-9])\d{4}\s*[가-힣]{1,3}\s*\d{2,6}(?![0-9])")),
+    ("전화번호", re.compile(r"(?<![0-9])0\d{1,2}[-\s]\d{3,4}[-\s]\d{4}(?![0-9])")),
+    ("계좌·번호열", re.compile(r"(?<![0-9-])\d{2,7}(?:[-\s]\d{2,7}){2,3}(?![0-9-])")),
+)
+
+
+def _peek(s: str) -> str:
+    """경고에 원문을 그대로 싣지 않는다 — 진짜 미탐이면 그 자체가 유출이다."""
+    s = s.strip()
+    return s[:2] + "…" + "○" * max(0, len(s) - 3) + s[-1:] if len(s) > 3 else s[:1] + "○"
+
+
+def scan_shapes(text: str) -> list[tuple[str, list[str]]]:
+    """출력물에 PII '모양'이 남았는지 — 탐지 규칙과 무관한 독립 점검."""
+    out = []
+    for name, rx in SHAPE_WARN:
+        hits = rx.findall(text)
+        if hits:
+            out.append((name, hits))
+    return out
+
+
+def _output_text(path: str) -> str:
+    if docx_io.is_docx(path):
+        return docx_io.read_text(path)
+    with fitz.open(path) as d:
+        return "".join(p.get_text() for p in d)
+
+
+def _finalize(report: dict, out_path: str) -> dict:
+    """리포트에 축소 모드 표시와 독립 모양 점검을 덧붙인다."""
+    report["engine"] = {
+        "ko_pii": detect_mod.ko_pii is not None,     # 없으면 정규식만 — 탐지 범위 축소
+        "ocr": bool(report.get("ocr_applied")),
+    }
+    if detect_mod.ko_pii is None:
+        report["warnings"].append(
+            "형태소 탐지기(ko-pii)가 없어 정규식만으로 동작했다 — 라벨 없는 자유문장 "
+            "속 이름은 탐지 범위 밖이다.")
+    try:
+        text = _output_text(out_path)
+    except Exception as e:                      # 점검 실패가 산출물을 막으면 안 된다
+        report["warnings"].append(f"출력물 모양 점검을 못 했다({e.__class__.__name__}).")
+        return report
+    for name, hits in scan_shapes(text):
+        sample = ", ".join(_peek(h) for h in hits[:3])
+        report["warnings"].append(
+            f"출력물에 {name} 모양이 {len(hits)}건 남아 있다(오탐 포함) — 확인 필요: {sample}")
+    return report
+
+
 def _redact_docx(in_path: str, out_path: str, mode: str, ledger_path: str | None, *,
                  skip, extra_names, excluded_names) -> dict:
     """DOCX 비실명화. 좌표가 아니라 OOXML 파트를 직접 고친다(docx_io 참조)."""
@@ -304,8 +367,10 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     if mode not in ("anon", "pseudo"):
         raise ValueError(f"mode는 anon|pseudo: {mode}")
     if docx_io.is_docx(in_path):
-        return _redact_docx(in_path, out_path, mode, ledger_path, skip=skip,
-                            extra_names=extra_names, excluded_names=excluded_names)
+        return _finalize(
+            _redact_docx(in_path, out_path, mode, ledger_path, skip=skip,
+                         extra_names=extra_names, excluded_names=excluded_names),
+            out_path)
     docx_io.assert_supported(in_path)   # .doc·.hwp·.xlsx·.pptx를 분명히 막는다
 
     # 익명화 모드에서도 법인·사건번호에는 가명이 필요하다. 다만 파일로는 남기지 않는다.
@@ -498,7 +563,7 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     for k, v in leftover_meta.items():
         residual.append(f"META:{k}={v}")
 
-    return {
+    return _finalize({
         "mode": mode,
         "ocr_applied": ocr_applied,
         "ledger": ledger_path if mode == "pseudo" else None,
@@ -511,7 +576,7 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
         # 이름·법인은 오탐 시 일반어가 통째로 칠해지므로 목록을 노출해 사람이 확인케 한다
         "persons": sorted(v for l, v in targets if l in ("PERSON", "NAME")),
         "orgs": sorted(v for l, v in targets if l == "ORG"),
-    }
+    }, out_path)
 
 
 def main() -> None:
@@ -562,6 +627,11 @@ def main() -> None:
     if report["unmapped"] or report["residual"]:
         print("FAIL: 매핑 실패 또는 잔존 PII — 출력물을 신뢰하지 말 것", file=sys.stderr)
         raise SystemExit(1)
+    if report["warnings"]:
+        # 경고는 실패가 아니지만 '조용한 성공'으로 넘겨서도 안 된다 — 축소 모드로
+        # 돌았거나 출력물에 PII 모양이 남은 경우가 여기 들어온다.
+        print("경고가 있다 — 위 항목을 확인할 것(산출물은 생성됨)", file=sys.stderr)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

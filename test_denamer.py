@@ -26,12 +26,27 @@ from denamer_out import redact
 from detect import detect
 from ledger import Ledger
 
+import detect as _detect_mod
+
+KO_PII = _detect_mod.ko_pii is not None
+
+# ko-pii(형태소 탐지기)만 잡을 수 있는 값. 라벨 없는 자유문장 속 이름은 정규식이
+# 여격 조사(에게·한테·께서·께)로만 좁혀 놓았다 — 모든 조사를 열면 오탐이 폭증한다.
+# ko-pii 없이 돌리면 이 값들의 미탐은 결함이 아니라 축소 모드의 정상 동작이다.
+# 이 구분이 없으면 README가 권하는 최소 구성이 테스트를 통과하지 못하고,
+# 그 실패가 진짜 회귀를 가린다.
+KO_PII_ONLY = {"박영희", "박OO"}
+
 _fail = 0
 _pass = 0
+_skip = 0
 
 
-def check(cond: bool, label: str, detail: str = "") -> None:
-    global _fail, _pass
+def check(cond: bool, label: str, detail: str = "", needs_ko_pii: bool = False) -> None:
+    global _fail, _pass, _skip
+    if needs_ko_pii and not KO_PII:
+        _skip += 1
+        return
     if cond:
         _pass += 1
     else:
@@ -254,11 +269,12 @@ def run_pdf_case(name, lines, must_gone, must_keep, mode="anon",
         text = "".join(p.get_text() for p in out)
         out.close()
         for v in must_gone:
-            check(v not in text, f"{name}: PII 잔존", repr(v))
+            check(v not in text, f"{name}: PII 잔존", repr(v), needs_ko_pii=v in KO_PII_ONLY)
         for v in must_keep:
             check(v in text, f"{name}: 과잉 제거", repr(v))
         for v in (must_have or []):
-            check(v in text, f"{name}: 대체 텍스트 누락", repr(v))
+            check(v in text, f"{name}: 대체 텍스트 누락", repr(v),
+                  needs_ko_pii=v in KO_PII_ONLY)
         return text
 
 
@@ -605,5 +621,7 @@ if __name__ == "__main__":
     test_thin_text_layer()
     test_ocr_metadata_scrub()
     test_docx()
-    print(f"\n{_pass} pass / {_fail} fail")
+    cfg = "ko-pii 있음" if KO_PII else "ko-pii 없음 — 정규식만(탐지 범위 축소)"
+    tail = f" / {_skip} skip" if _skip else ""
+    print(f"\n{_pass} pass / {_fail} fail{tail}   [{cfg}]")
     sys.exit(1 if _fail else 0)
