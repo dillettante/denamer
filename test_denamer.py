@@ -559,7 +559,7 @@ def test_docx() -> None:
             raw = "\n".join(z.read(n).decode("utf-8", "ignore") for n in z.namelist())
         for needle in ["김철수", "880101-1234567", "010-1234-5678", "이영희", "박민수",
                        "2020가합12345", "동방화학", "강서연", "정수현",
-                       "gildong.hong", "홍길동", "장서윤", "최민호", "내부 검토용"]:
+                       "gildong.hong", "홍길동", "최민호", "장서윤", "내부 검토용"]:
             check(needle not in raw, "DOCX 원문 잔존", repr(needle))
 
         # 쪼개진 run 이 제대로 합쳐졌는지 — 가운데 조각이 남는 유형의 결함 확인

@@ -22,4 +22,28 @@ if [ -n "$HITS" ]; then
   echo "$HITS"
   exit 1
 fi
+
+# ── 2차: 실명·소속·사내 프로젝트명 ──────────────────────────────
+# 위 정규식은 경로·계정·메일만 본다. 실측: 주석의 출처 표기와 테스트 픽스처
+# (DOCX 변경이력 w:author, docProps 의 Company·Manager)로 실명과 소속이 다시
+# 들어왔는데 검사를 그대로 통과했다.
+#
+# 금칙어는 .private_terms(추적 제외)에 한 줄 하나씩 둔다. 목록을 이 스크립트에
+# 직접 적으면 지우려던 값이 공개 저장소에 그대로 실린다.
+TERMS=".private_terms"
+if [ -s "$TERMS" ]; then
+  NAME_HITS=$(git ls-files -z \
+              | xargs -0 grep -nIF -f "$TERMS" 2>/dev/null \
+              | grep -vE '^(denamer\.html|check_no_private\.sh):' || true)
+  if [ -n "$NAME_HITS" ]; then
+    echo "실명·소속 의심 항목이 추적 파일에 있습니다 — push하지 마세요:"
+    echo "$NAME_HITS"
+    exit 1
+  fi
+  echo "실명 검사 통과 (금칙어 $(grep -cve '^[[:space:]]*$' "$TERMS")개)"
+else
+  echo "주의: $TERMS 가 없어 실명 검사를 건너뜁니다."
+  echo "      실명·소속·사내 프로젝트명을 한 줄에 하나씩 적어 두세요(이 파일은 추적되지 않습니다)."
+fi
+
 echo "개인정보 검사 통과 (추적 파일 $(git ls-files | wc -l | tr -d ' ')건)"
