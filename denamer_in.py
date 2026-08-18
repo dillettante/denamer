@@ -95,6 +95,17 @@ def _free_alias(ledger: Ledger, kind: str, value: str, text: str) -> str:
     raise SystemExit(f"가명 표기를 만들 수 없습니다({alias}) — --style token 을 쓰세요")
 
 
+def _norm(s: str) -> str:
+    """공백을 뗀 형태 — 자간 표기와 정규화된 값을 같은 키로 맞춘다."""
+    return re.sub(r"\s+", "", s)
+
+
+def _flexible(value: str) -> str:
+    """글자 사이에 공백이 끼어도 찾는 형태 — '홍 길 동'. 공백 0개도 허용하므로
+    리터럴 표기까지 함께 잡는다(docx_io._flexible 와 같은 방식)."""
+    return r"[ \t]*".join(re.escape(c) for c in value if not c.isspace())
+
+
 def mask(text: str, *, style: str = "token", ledger: Ledger | None = None,
          skip=(), extra_names=(), excluded_names=()) -> dict:
     """원문 → 마스킹된 텍스트 + 복원 매핑표.
@@ -131,8 +142,13 @@ def mask(text: str, *, style: str = "token", ledger: Ledger | None = None,
     # 원문에 표기와 같은 문자열이 이미 있으면 복원 때 뒤섞인다 — 조용히 넘기지 않는다
     collisions = sorted(m for m in token_map if _standalone(m, text))
 
-    pattern = re.compile("|".join(re.escape(v) for _, v in targets))
-    masked = pattern.sub(lambda m: value_to_mark[m.group(0)], text)
+    # 자간이 벌어진 표기('홍 길 동')는 정규화된 값이 원문에 문자열로 존재하지 않아
+    # 리터럴 치환으로는 한 건도 안 바뀐다 — 탐지는 되는데 치환만 실패하고, 잔존
+    # 검사까지 같은 리터럴이라 조용히 통과했다(실측). 글자 사이 공백을 허용한다.
+    norm_to_mark = {_norm(v): mark for v, mark in value_to_mark.items()}
+    pattern = re.compile("|".join(
+        _flexible(v) for _, v in sorted(targets, key=lambda t: -len(t[1]))))
+    masked = pattern.sub(lambda m: norm_to_mark[_norm(m.group(0))], text)
     return {"masked": masked, "token_map": token_map,
             "collisions": collisions, "style": style}
 
@@ -188,7 +204,8 @@ def _cmd_mask(args) -> int:
 
     # 마스킹 결과에 원문이 남았는지 즉시 재검사한다 — 탐지한 값에 한해서지만,
     # 치환 누락(정규식 이스케이프 사고 등)은 여기서 반드시 걸린다
-    residual = [m for m, e in result["token_map"].items() if e["original"] in result["masked"]]
+    residual = [m for m, e in result["token_map"].items()
+                if re.search(_flexible(e["original"]), result["masked"])]
 
     print(json.dumps({
         "표기": result["style"],

@@ -205,7 +205,10 @@ class _NameCollector:
         extra_ok: 후보별로 추가 조건을 거는 콜백(친족 관계어 규칙이 쓴다).
         """
         raw = re.sub(r"\s+", "", self.text[start:end])
-        if not self._following_ok(end):            # 회사명 앞토막 차단
+        # 회사명 앞토막 차단. 단 후보가 조사로 끝나면 뒤따르는 단어는 같은 고유명사의
+        # 뒷부분이 아니라 별개 토큰이다 — 조사를 안 보면 '김철수는 주식회사 동방화학을'
+        # 에서 뒤 단어가 법인꼬리라는 이유로 실명이 통째로 미탐된다(실측).
+        if len(self.candidates(raw)) == 1 and not self._following_ok(end):
             return False
         for cand in self.candidates(raw):
             if not self._accepts(cand):

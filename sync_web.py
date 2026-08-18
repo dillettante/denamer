@@ -98,7 +98,11 @@ def generate() -> str:
     out.append("")
     out.append("// 이름 문맥 규칙 — 1번 그룹이 이름 자리다")
     out.append("const NAME_PATTERNS = [")
+    # names.py 가 쓰는 규칙 전부. 손으로 나열하는 목록이라 새 규칙이 생기면 빠지기
+    # 쉽다 — 실측: _PAT_WIDE_LABEL(자간 벌어진 라벨 '피 고 인')이 누락돼 스캔 문서의
+    # 이름이 웹판에서만 미탐이었다. 개수는 아래에서 이 목록으로 세므로 함께 어긋나지 않는다.
     for pat in (N._PAT_LEGAL_PREFIX, N._PAT_GENERAL_PREFIX, N._PAT_RELATION_PREFIX,
+                N._PAT_WIDE_LABEL,
                 N._PAT_LEGAL_SUFFIX, N._PAT_GENERAL_SUFFIX, N._PAT_HONORIFIC,
                 N._PAT_PAREN_ID, N._PAT_COPULA, N._PAT_MASKED_STYLE, N._PAT_DATIVE):
         # 관계어 규칙만 추가 조건이 붙는다(친족 문맥 불용어)
@@ -129,7 +133,8 @@ def main() -> None:
         print("변경 없음 — 웹판이 이미 코어와 같습니다.")
         return
     html_path.write_text(new_html, encoding="utf-8")
-    print(f"denamer.html 갱신 — 규칙 {len(D.RULES)}종, 이름 규칙 10종, "
+    n_name = new_html.count('", "gd")')          # 위 목록에서 실제로 나간 개수
+    print(f"denamer.html 갱신 — 규칙 {len(D.RULES)}종, 이름 규칙 {n_name}종, "
           f"비이름 사전 {len(S.SURNAME_STOPWORDS)}단어")
 
 
