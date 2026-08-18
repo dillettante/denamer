@@ -323,6 +323,15 @@ def _finalize(report: dict, out_path: str) -> dict:
     return report
 
 
+def _drop_ocr_tmp(path: str | None) -> None:
+    """OCR 임시본은 비실명화 전 원문이다 — 예외로 빠져나가도 반드시 지운다."""
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def _hidden_text(doc) -> str:
     """본문 밖에 있어 page.get_text()로는 안 보이는 자리의 텍스트.
 
@@ -454,6 +463,10 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
         doc.close()
         ocr_tmp = _run_ocr(in_path, force=bool(full_text.strip()))
         doc = fitz.open(ocr_tmp)
+        # 연 직후 지운다. POSIX는 열린 파일을 지워도 열어 둔 쪽이 계속 읽으므로
+        # 동작에 지장이 없고, 그 뒤 어디서 예외가 나도 비실명화 전 원문이 /tmp 에
+        # 남지 않는다(try/finally 로 감싸는 것보다 창 자체가 없다).
+        _drop_ocr_tmp(ocr_tmp)
         full_text = "".join(page.get_text() for page in doc)
         ocr_applied = True
         if not full_text.strip():
@@ -603,8 +616,7 @@ def redact(in_path: str, out_path: str, mode: str = "anon",
     doc.set_metadata({})
     doc.save(out_path, garbage=4, deflate=True)
     doc.close()
-    if ocr_tmp and os.path.exists(ocr_tmp):
-        os.unlink(ocr_tmp)
+    _drop_ocr_tmp(ocr_tmp)
     if mode == "pseudo":
         ledger.save()
 

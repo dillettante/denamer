@@ -199,8 +199,12 @@ def _cmd_mask(args) -> int:
     key_path = args.key or f"{stem}{KEY_SUFFIX}"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(result["masked"])
-    with open(key_path, "w", encoding="utf-8") as f:
+    # 복원키는 원문 개인정보 그 자체다. 기본 umask(0644)로 두면 같은 기기의
+    # 다른 계정이 그대로 읽는다 — 만들면서 곧바로 소유자 전용으로 좁힌다.
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(result["token_map"], f, ensure_ascii=False, indent=2)
+    os.chmod(key_path, 0o600)      # 이미 있던 파일이면 O_CREAT 권한이 안 먹는다
 
     # 마스킹 결과에 원문이 남았는지 즉시 재검사한다 — 탐지한 값에 한해서지만,
     # 치환 누락(정규식 이스케이프 사고 등)은 여기서 반드시 걸린다
